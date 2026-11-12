@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "description": "Model Lab configuration for the Gas Ops Knowledge Assistant. activeModelId is the model the live chat API uses for answer generation. Weights are percentages and always sum to 100.",
+  "weights": { "quality": 50, "cost": 25, "latency": 25 },
+  "activeModelId": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+  "selectionPolicy": {
+    "switchMarginPoints": 2.0,
+    "maxLatencyMs": 20000,
+    "requireGroundedAnswer": true,
+    "qualityPriorWeight": 0.75,
+    "qualityLiveWeight": 0.25,
+    "measurementTtlSeconds": 120,
+    "typicalRequest": { "inputTokens": 1500, "outputTokens": 300 }
+  },
+  "models": [
+    {
+      "id": "us.anthropic.claude-sonnet-4-6",
+      "name": "Claude Sonnet 4.6",
+      "vendor": "Anthropic",
+      "qualityPrior": 95,
+      "pricePer1M": { "input": 3.30, "output": 16.50 },
+      "reasoning": "extended-thinking",
+      "openWeights": false,
+      "strengths": "Highest answer quality and nuance; strong instruction-following and citation discipline; extended thinking"
+    },
+    {
+      "id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "name": "Claude Haiku 4.5",
+      "vendor": "Anthropic",
+      "qualityPrior": 85,
+      "pricePer1M": { "input": 1.10, "output": 5.50 },
+      "reasoning": "extended-thinking",
+      "openWeights": false,
+      "strengths": "Near-frontier quality at low latency; reliable grounding and citations; extended thinking"
+    },
+    {
+      "id": "us.deepseek.r1-v1:0",
+      "name": "DeepSeek-R1",
+      "vendor": "DeepSeek",
+      "qualityPrior": 82,
+      "pricePer1M": { "input": 1.35, "output": 5.40 },
+      "reasoning": "native",
+      "openWeights": true,
+      "strengths": "Open-weight reasoning model that always shows its chain of thought; strong multi-step logic; slower"
+    },
+    {
+      "id": "openai.gpt-oss-120b-1:0",
+      "name": "gpt-oss-120b",
+      "vendor": "OpenAI",
+      "qualityPrior": 80,
+      "pricePer1M": { "input": 0.15, "output": 0.60 },
+      "reasoning": "native",
+      "openWeights": true,
+      "strengths": "Open-weight reasoning model from OpenAI; excellent quality per dollar"
+    },
+    {
+      "id": "mistral.mistral-large-3-675b-instruct",
+      "name": "Mistral Large 3",
+      "vendor": "Mistral AI",
+      "qualityPrior": 78,
+      "pricePer1M": { "input": 0.50, "output": 1.50 },
+      "reasoning": "none",
+      "openWeights": true,
+      "strengths": "Large open-weight European model; strong multilingual and enterprise instruction-following"
+    },
+    {
+      "id": "us.meta.llama4-maverick-17b-instruct-v1:0",
+      "name": "Llama 4 Maverick 17B",
+      "vendor": "Meta",
+      "qualityPrior": 72,
+      "pricePer1M": { "input": 0.24, "output": 0.97 },
+      "reasoning": "none",
+      "openWeights": true,
+      "strengths": "Mixture-of-experts open-weight model; very fast and inexpensive; concise answers"
+    },
+    {
+      "id": "us.amazon.nova-pro-v1:0",
+      "name": "Amazon Nova Pro",
+      "vendor": "Amazon",
+      "qualityPrior": 70,
+      "pricePer1M": { "input": 0.80, "output": 3.20 },
+      "reasoning": "none",
+      "openWeights": false,
+      "strengths": "AWS first-party balanced model; low latency; deep Bedrock feature support (guardrails, distillation)"
+    },
+    {
+      "id": "us.amazon.nova-micro-v1:0",
+      "name": "Amazon Nova Micro",
+      "vendor": "Amazon",
+      "qualityPrior": 55,
+      "pricePer1M": { "input": 0.035, "output": 0.14 },
+      "reasoning": "none",
+      "openWeights": false,
+      "strengths": "Text-only, lowest cost and latency in the catalog; best for simple lookups at very high volume"
+    }
+  ],
+  "lastEvaluation": null,
+  "history": []
+}

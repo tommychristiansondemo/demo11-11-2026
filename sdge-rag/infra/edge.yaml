@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SDGE Gas Ops RAG Assistant - EDGE stack (must be deployed in us-east-1).
+  Contains only the resources CloudFront requires in us-east-1: the ACM
+  certificate and the CLOUDFRONT-scoped WAF web ACL.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: sdge-rag
+    Description: Name prefix (sdge-rag for the Gas Ops app, sdge-insights for Class Insights)
+  EnvName:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  DomainName:
+    Type: String
+    Description: FQDN the SPA is served from (e.g. demo.awsteach.com)
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+  RateLimitPer5Min:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    Description: Max requests per client IP per 5-minute window before WAF blocks
+  AllowedCidrs:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional IP allow-list (e.g. corporate egress ranges, 203.0.113.0/24).
+      When empty, all IPs are allowed (subject to the block list and rate limit).
+  BlockedCidrs:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Optional IP block-list.
+
+Conditions:
+  HasAllowList: !Not [!Equals [!Join ["", !Ref AllowedCidrs], ""]]
+  HasBlockList: !Not [!Equals [!Join ["", !Ref BlockedCidrs], ""]]
+
+Resources:
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - { Key: app, Value: !Ref AppName }
+        - { Key: env, Value: !Ref EnvName }
+
+  AllowedIpSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: !Sub ${AppName}-${EnvName}-allowed
+      Scope: CLOUDFRONT
+      IPAddressVersion: IPV4
+      Addresses: !If [HasAllowList, !Ref AllowedCidrs, []]
+
+  BlockedIpSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: !Sub ${AppName}-${EnvName}-blocked
+      Scope: CLOUDFRONT
+      IPAddressVersion: IPV4
+      Addresses: !If [HasBlockList, !Ref BlockedCidrs, []]
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${AppName}-${EnvName}-cf
+      Scope: CLOUDFRONT
+      Description: Rate limiting, IP restrictions and AWS managed protections
+      DefaultAction: !If [HasAllowList, { Block: {} }, { Allow: {} }]
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${AppName}-${EnvName}-cf
+      Rules:
+        - Name: BlockListedIps
+          Priority: 0
+          Action: { Block: {} }
+          Statement:
+            IPSetReferenceStatement: { Arn: !GetAtt BlockedIpSet.Arn }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: BlockListedIps
+        - Name: RateLimitPerIp
+          Priority: 1
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitPer5Min
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIp
+        - Name: AmazonIpReputation
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AmazonIpReputation
+        - Name: CommonRuleSet
+          Priority: 3
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              # Chat payloads (question + history) can exceed 8 KB.
+              RuleActionOverrides:
+                - Name: SizeRestrictions_BODY
+                  ActionToUse: { Count: {} }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSet
+        - !If
+          - HasAllowList
+          - Name: AllowListedIps
+            Priority: 10
+            Action: { Allow: {} }
+            Statement:
+              IPSetReferenceStatement: { Arn: !GetAtt AllowedIpSet.Arn }
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: AllowListedIps
+          - !Ref AWS::NoValue
+      Tags:
+        - { Key: app, Value: !Ref AppName }
+        - { Key: env, Value: !Ref EnvName }
+
+Outputs:
+  CertificateArn:
+    Value: !Ref Certificate
+  WebAclArn:
+    Value: !GetAtt WebAcl.Arn

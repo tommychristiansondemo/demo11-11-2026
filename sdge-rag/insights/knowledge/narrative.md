@@ -1,0 +1,573 @@
+# Project Knowledge: Gas Ops Knowledge Assistant + Class Insights
+
+This file (`projectknowledge.md`) is the knowledge source for the Class Insights chatbot. It is stored in S3
+(`s3://sdge-insights-prod-knowledge-<account>-us-east-2/projectknowledge.md`). It has two parts:
+
+1. **This narrative**: design, rationale, flows and change log. It is maintained by hand and kept in the repo at
+   `insights/knowledge/narrative.md`. It is updated whenever functionality is added.
+2. **The live inventory appendix** at the end. The `sdge-insights-prod-knowledge` Lambda regenerates it from AWS
+   APIs after every CloudFormation stack change, every 6 hours, and after every deployment.
+
+Everything about the design and deployment is shared openly with students. The only things deliberately left out
+are secret values: the API Gateway key value, the database password, and user tokens.
+
+---
+
+## 1. What was built, and why
+
+The class was given this brief: *"Design and deploy a production-grade internal RAG (Retrieval-Augmented
+Generation) Q&A assistant for SDGE gas utility employees using AWS services."* Employees ask natural-language
+questions about gas operations, safety procedures, maintenance protocols, regulatory compliance and company
+policies. Answers must be grounded in internal documents that administrators upload.
+
+Two applications were deployed into AWS account `154833006816`:
+
+| App | URL | Purpose |
+|---|---|---|
+| **Gas Ops Knowledge Assistant** (the "main app") | https://demo.awsteach.com | The RAG Q&A assistant from the brief |
+| **Class Insights** (this app) | https://demo-insights.awsteach.com | Teaching companion: explains the deployment, shows live logs, metrics and LLM traces, answers questions |
+
+Both were designed, coded and deployed by Claude Code (Anthropic's coding agent) working for the instructor.
+All infrastructure is written as CloudFormation. The code is in one repository (`sdge-rag/`): `infra/`, `backend/`, `frontend/`, `scripts/`, `sample-docs/` and `insights/`.
+
+### Requirements from the brief and how each was met
+
+| Requirement | Implementation |
+|---|---|
+| React SPA on S3 + CloudFront | Vite/React 18 SPA in a private S3 bucket, served by CloudFront through Origin Access Control (OAC). The instructor changed the hostname from www.awsteach.com to **demo.awsteach.com** because another class demo uses www. |
+| Cognito auth, SSO, employees only | Cognito user pool with self-registration. Optional SAML 2.0 federation (Entra ID, Okta, ADFS or IAM Identity Center) via the `SamlMetadataUrl` parameter. It is not enabled in the demo because there is no corporate IdP. |
+| Bedrock LLM (Claude 3.5 Haiku/Sonnet) | Claude 3.5 Haiku and Sonnet have been **retired** on Bedrock (end of life). Claude Haiku 5.5 and Sonnet 5.x are not enabled on this account. The closest available successor in the Haiku tier is used: **Claude Haiku 4.5** (`us.anthropic.claude-haiku-4-5-20251001-v1:0`, a US cross-region inference profile). It is the starting model. The live model is now chosen by students in the **Model Lab** and stored in AWS AppConfig (section 6a), so it can change without a redeploy. |
+| Vector store: OpenSearch Serverless or pgvector on RDS | **Aurora PostgreSQL Serverless v2 (16.9) with pgvector**, accessed through the **RDS Data API** |
+| Lambda ingestion: chunk + Titan embeddings | S3-triggered ingestion Lambda: extract text, then chunk, embed with **Amazon Titan Text Embeddings v2** (1024 dimensions) and store in pgvector |
+| IaC with dev/staging/prod | CloudFormation templates parameterised by `EnvName`, with per-environment settings in `infra/env/{dev,staging,prod}.env`. Only **prod** is deployed (cost). |
+| CloudWatch monitoring, structured logs, SNS alerts | Lambda native JSON logs, Embedded Metric Format (EMF) custom metrics, 8 alarms, an SNS topic and a dashboard |
+| API Gateway throttling + usage plans | REST API with stage throttling, a usage plan (rate, burst and daily quota) and a required API key |
+| CloudFront WAF: rate limiting + IP restrictions | WAFv2 web ACL: per-IP rate limit, IP block list, optional IP allow list, AWS managed IP-reputation and common rule sets |
+| Parameter Store / Secrets Manager | SSM parameters for runtime configuration. The Aurora master password is generated and stored by RDS in Secrets Manager (`ManageMasterUserPassword`). |
+| CI/CD with CodePipeline | CodePipeline V2: S3 source, then Validate (cfn-lint, pyflakes, build), an optional manual approval, then Deploy (CodeBuild runs `scripts/deploy.sh`) |
+| ACM certificate for HTTPS | DNS-validated ACM certificates in us-east-1 (required by CloudFront), validated automatically in the existing awsteach.com Route 53 zone |
+
+### Instructor-specific requirements
+
+- **Region**: everything that can live outside us-east-1 is in **us-east-2 (Ohio)**. Another Claude Code session
+  was deploying a different demo into us-east-1 at the same time. Only the CloudFront ACM certificates and the
+  CLOUDFRONT-scoped WAF web ACLs are in us-east-1, because CloudFront requires them there. All resources are
+  prefixed `sdge-rag-` or `sdge-insights-` so they never collide with the other demo.
+- **Accounts**: no shared sample credentials. Every student registers their own accounts and may register many,
+  as either an **Employee** or an **Administrator**. The password minimum is 6 characters with no complexity
+  rules, and there is **no email verification** (a Cognito PreSignUp Lambda auto-confirms). The registration form
+  asks only for account type, username and password. It never asks for an email address. A "display name" field
+  was removed after the instructor said it was confusing next to the username.
+- **Class Insights** uses the same Cognito accounts, so no separate credentials are needed. Any logged-in user,
+  of either role, gets full access to everything in it.
+
+---
+
+## 2. Architecture
+
+```
+ Browser
+   │  https://demo.awsteach.com                         https://demo-insights.awsteach.com
+   ▼                                                      ▼
+ CloudFront ──WAF (us-east-1)──┐                        CloudFront ──WAF (us-east-1)──┐
+   ├─ /*      → S3 SPA bucket (OAC)                       ├─ /*     → S3 SPA bucket (OAC)
+   └─ /api/*  → API Gateway REST (us-east-2)              └─ /api/* → API Gateway HTTP API (us-east-2)
+                 Cognito authorizer + API key + usage plan              JWT authorizer (same Cognito pool)
+                    │                                                      │
+                    ▼                                                      ▼
+          VPC Link → internal NLB                                      VPC Link → Cloud Map (no load balancer)
+               Fargate svc sdge-rag-prod-api ──► Bedrock (Model Lab)  Fargate svc sdge-insights-prod-chat ──► Bedrock Haiku 4.5
+                    │      ├──────────────► Bedrock Titan Embed v2        │  tools: CloudWatch Logs/Metrics/Alarms,
+                    │      └──────────────► AWS AppConfig (model-selection)│  CloudFormation, CodePipeline, AppConfig,
+                    ▼                                                      │  S3 listing
+               Aurora Serverless v2 + pgvector (Data API)              Lambda sdge-insights-prod-data (UI panels)
+                    ▲                                                  Lambda sdge-insights-prod-knowledge → projectknowledge.md (S3)
+ S3 docs bucket ──(Object Created → EventBridge rule → ecs:RunTask)──► Fargate task sdge-rag-prod-ingest (1 per document)
+   ▲ presigned PUT from the browser (admins only)
+```
+
+### Why these choices (trade-offs to discuss in class)
+
+- **Aurora + Data API instead of OpenSearch Serverless.** OpenSearch Serverless has a fixed minimum cost of
+  several OCUs, roughly $175–$350 a month even when idle. Aurora Serverless v2 at 0.5 ACU costs about $1.50 a day.
+  The **Data API** is an HTTPS API over SQL, so the Lambdas don't need a VPC attachment, NAT gateway (about
+  $32 a month plus data) or VPC endpoints. The database sits in isolated private subnets with no inbound
+  security-group rules at all. pgvector also lets the retrieval query JOIN against document metadata (for example
+  `WHERE status = 'ready'`) in one SQL statement.
+- **Same-origin API through CloudFront.** The SPA calls `/api/*` on its own domain, and CloudFront forwards it to
+  API Gateway. That means there's no CORS configuration, and the WAF protects the API too.
+- **REST API (v1) for the main app.** Usage plans and API keys, which the brief asked for, only exist on REST
+  APIs. Class Insights uses the cheaper, simpler **HTTP API (v2)** with a native JWT authorizer.
+- **API key in the SPA is not a secret.** The usage-plan API key ships in the public `config.js`. It identifies
+  the client for metering and throttling only; authorization comes from the Cognito ID token. That's how AWS
+  documents API keys ("not for authorization"). Its value is still never shown in Class Insights.
+- **Region split.** CloudFront is a global service whose certificates and WAF ACLs must be in us-east-1. Everything
+  else follows the instructor's request for us-east-2.
+- **Model choice.** Haiku is fast and inexpensive, which matters behind API Gateway's 29-second integration timeout.
+  Extended thinking is enabled with a 1,024-token budget, so every answer has recorded reasoning for students to inspect.
+
+---
+
+## 3. Request flows
+
+### 3.1 Registration and sign-in (main app)
+1. The SPA calls the Cognito `SignUp` API directly (no Amplify SDK) with username, password and
+   `custom:role` = `employee` or `admin`. `custom:role` is immutable after sign-up.
+2. The **PreSignUp** Lambda (`sdge-rag-prod-presignup`) sets `autoConfirmUser = true`, so no verification step is needed.
+3. The **PostConfirmation** Lambda (`sdge-rag-prod-postconfirm`) adds the user to the `employees` or `admins` group.
+4. The SPA calls `InitiateAuth` (`USER_PASSWORD_AUTH`) and gets ID, access and refresh tokens (ID token valid
+   for 60 minutes, refresh token for 7 days). The ID token's `cognito:groups` claim drives the admin-only UI
+   and the API authorization checks.
+
+### 3.2 Asking a question (RAG)
+1. `POST /api/chat` goes from CloudFront (WAF) to API Gateway REST, which checks the Cognito authorizer and API
+   key, then over a **VPC Link** to an internal Network Load Balancer and the **Fargate** service `sdge-rag-prod-api`
+   (gunicorn in an arm64 container; the container re-verifies the Cognito JWT signature as defence in depth).
+2. The question is embedded with Titan Text Embeddings v2 (1,024 dimensions, normalised).
+3. pgvector cosine search: `ORDER BY embedding <=> query LIMIT 6` (top-k from Parameter Store, default 6) over
+   chunks of documents whose status is `ready`. Passages with similarity below **0.15** are dropped.
+4. The numbered passages and the question are sent to the Model Lab's active model (read from AppConfig) through the Bedrock **Converse** API, with
+   the system prompt in section 6, up to 6 prior chat turns, and extended thinking enabled.
+5. The answer cites passages as [1], [2] and so on. The UI turns these into clickable citation chips with the
+   excerpt, similarity score and a presigned link to the original file.
+6. The API task writes an **`llm_trace`** structured log record (section 7), publishes custom metrics (ChatRequests,
+   InputTokens, OutputTokens, LlmLatencyMs, RetrievalLatencyMs, RetrievalTopScore) and inserts a row into the
+   `chat_log` table, which feeds the admin "Usage" tab.
+
+### 3.3 Uploading and ingesting a document (admins)
+1. `POST /api/documents` (admins only) creates a `documents` row with status `uploading` and returns a
+   15-minute **presigned S3 PUT URL**. Allowed types are PDF, DOCX, TXT and MD, up to 25 MB, each with a category.
+2. The browser PUTs the file straight to S3 (`uploads/<docId>/<filename>`). The bucket's CORS rules allow only the
+   app's origin. File bytes never pass through API Gateway or the API service.
+3. S3 sends an `Object Created` event to **EventBridge**; rule `sdge-rag-prod-ingest-on-upload` runs **one Fargate
+   task** (`sdge-rag-prod-ingest`, 1 vCPU / 2 GiB, arm64, command `python ingest_task.py`) with the bucket and key
+   passed as container environment overrides. EventBridge retries `RunTask` up to 3 times and sends undeliverable
+   events to the SQS dead-letter queue. The task indexes the document, starts the Bedrock KB sync and exits.
+   (Re-index and delete launch the same task definition from the API with `ecs:RunTask`.)
+4. Text extraction: PDF with **pypdf**, DOCX by parsing `word/document.xml` directly (no native dependencies),
+   TXT and MD as UTF-8.
+5. Chunking is paragraph-aware: about **1,200 characters** per chunk with **200 characters of overlap** inside a
+   section. A new section heading starts a fresh chunk, the nearest heading is prefixed for context, and the page
+   number is kept for PDFs.
+6. Each chunk is embedded with Titan v2 (8 parallel threads) and inserted 25 at a time via `BatchExecuteStatement`.
+   The document becomes `ready`, or `failed` with the error. Failures raise CloudWatch alarms.
+7. Re-index (`POST /api/documents/{id}/reindex`) re-invokes ingestion asynchronously. Delete removes the row, the
+   chunks (cascade) and every S3 object version.
+
+### 3.4 Database schema (Aurora PostgreSQL `ragdb`)
+- `documents(id, name, category, s3_key, content_type, size_bytes, status, error, chunk_count, page_count, uploaded_by, uploaded_at, indexed_at)`
+- `chunks(id, doc_id → documents ON DELETE CASCADE, chunk_index, page, content, embedding vector(1024))`, with an
+  **HNSW** index using `vector_cosine_ops`
+- `chat_log(id, username, question, answer, sources jsonb, latency_ms, created_at)`
+- Created by a CloudFormation **custom resource** Lambda (`sdge-rag-prod-dbinit`) once the cluster is available.
+
+---
+
+## 4. Where the data came from
+
+The knowledge base was seeded with **five fictional training documents**, written for this demo and
+clearly marked "FICTIONAL TRAINING SAMPLE — not an actual SDG&E document":
+
+| Document | Format | Category | Topics |
+|---|---|---|---|
+| GS-EM-101 Gas Leak and Emergency Response | PDF | Safety Procedures | make-safe steps, evacuation at ≥10% LEL, leak grades 1/2/3, dig-in response, reporting |
+| GS-SF-210 PPE and Field Safety Policy | PDF | Safety Procedures | minimum PPE, FR clothing ≥8 cal/cm², excavation, confined spaces, heat illness, driving |
+| GS-MT-150 Distribution Maintenance Protocols | PDF | Maintenance Protocols | leak-survey intervals, cathodic protection (−850 mV), valves, regulator stations, purging, pressure tests, OQ |
+| GS-RC-300 Regulatory Compliance Guide | DOCX | Regulatory Compliance | 49 CFR 191/192/199, CPUC GO 112-F, incident reporting timelines, damage prevention (811), DIMP |
+| HR-GO-400 Employee Policies | Markdown | Company Policies | on-call, overtime/rest, fitness for duty, vehicles, training, information security |
+
+They were generated from the Markdown sources in `sample-docs/src/` (PDFs with reportlab, DOCX with a minimal
+OOXML writer) and uploaded through the real admin upload path by `scripts/e2e.py seed`. Some intervals cite real
+federal rules (for example 49 CFR 192 leak-survey intervals). The company-specific details (extensions,
+form numbers, internal policies) are invented. Students can upload their own documents as Administrators. The
+live list of current documents is in the appendix and available through the `get_document_library` tool.
+
+---
+
+## 5. Security design
+
+- **Identity**: Cognito user pool `sdge-rag-prod` with username sign-in (case-insensitive), a 6-character minimum
+  password (demo setting), self sign-up, auto-confirmation and no email. Groups are `admins` and `employees`. App
+  client `sdge-rag-prod-spa` has no secret and allows the USER_PASSWORD, SRP and REFRESH_TOKEN flows. The hosted UI
+  domain and OAuth code flow exist for optional SAML SSO. `PreventUserExistenceErrors` is on.
+- **Authorization**: the API Gateway Cognito authorizer validates the ID token. The Lambda enforces admin-only
+  routes from `cognito:groups`. Employees can ask questions, browse documents and open them; admins can also
+  upload, re-index and delete documents and view Usage.
+- **Edge**: WAF blocks any IP over **2,000 requests per 5 minutes**. It also applies the AWS IP-reputation list,
+  the AWS Common Rule Set (body-size rule set to count, because chat payloads can exceed 8 KB), and an optional IP
+  allow list or block list (both empty in the demo). CloudFront enforces TLS 1.2+, HSTS, a strict
+  Content-Security-Policy, `X-Frame-Options: DENY`, nosniff and a strict referrer policy.
+- **API throttling**: the main API's stage and usage plan allow 25 requests per second steady and 50 burst, with
+  a 20,000-request daily quota. The Class Insights HTTP API allows 10 per second with a burst of 20.
+- **Data protection**: all buckets are private with Block Public Access and SSE-S3, and deny non-TLS access. The
+  docs bucket is versioned. Aurora storage is encrypted. The DB password exists only in Secrets Manager. Lambdas
+  have least-privilege roles scoped to `sdge-rag-prod-*` resources.
+- **Class Insights isolation**: its Lambda role is read-only (logs, metrics, alarms, stack inventory, function
+  configuration, plain SSM parameters, the pipeline, and listing the docs bucket). It has an **explicit Deny** on
+  `secretsmanager:*`, `apigateway:*` (so it can never read API key values), `rds-data:*` and `ssm:GetParameter(s)`. It has no KMS permissions at all. All tool output passes through a redactor that masks JWTs, AWS access key IDs, presigned
+  URL signatures and `password`/`secret`/`apiKey`/`authorization` values. This is defence in depth: even a
+  prompt-injected chatbot cannot reach a secret.
+
+---
+
+## 6. LLM usage and prompts
+
+| Caller | Model | Settings | Purpose |
+|---|---|---|---|
+| `sdge-rag-prod-api` (chat) | **Chosen by the Model Lab** and stored in AWS AppConfig. The starting model is Claude Haiku 4.5 (`us.anthropic.claude-haiku-4-5-20251001-v1:0`). The live model is listed in the appendix ("Model Lab: current LLM selection") | Converse API. Anthropic models get extended thinking (budget 1,024) and max output 1,200 plus the budget. Native reasoning models (DeepSeek-R1, gpt-oss) get max output 1,200 + 2,048 at temperature 0.1. Other models get 1,200 at temperature 0.1 | Grounded answers with citations |
+| `sdge-rag-prod-api` (Model Lab benchmark) | All 8 catalog models, in parallel | Same system prompt and request shape as chat; 2 test questions per model; 14-second read timeout | Live quality/latency/token measurements |
+| `sdge-rag-prod-api` / `-ingest` | Amazon Titan Text Embeddings v2 (`amazon.titan-embed-text-v2:0`) | 1,024 dimensions, normalised | Query and chunk embeddings |
+| `sdge-insights-prod-chat` | Claude Haiku 4.5 | Converse API with tool use (11 tools), extended thinking budget 1,024, up to 5 tool rounds, 22-second time budget | Class Insights chatbot |
+
+Runtime knobs for the main app are in Parameter Store under `/sdge-rag/prod/`: `embedding-model-id`, `retrieval-top-k`, `max-output-tokens` and `reasoning-budget-tokens` (0 disables thinking).
+The API Lambda caches them for 5 minutes. The account was checked for access to each model. Claude 3 Haiku and
+3.5 models returned "end of life", and Haiku 5.5 and Sonnet 5.x returned "not available for this account".
+Haiku 4.5 and Sonnet 4.6 work. (The chat model used to be the SSM parameter `chat-model-id`. Since the Model Lab
+was added it lives in AppConfig; see section 6a.)
+
+### Main app system prompt (verbatim)
+```
+{{MAIN_SYSTEM_PROMPT}}
+```
+The user message is built as: `Context excerpts from internal documents:` followed by numbered passages
+(`[n] (Source: <doc>, page <p>)` and the text), then `---`, then `Employee question: <question>`.
+
+### Class Insights chatbot system prompt (verbatim; this file is inserted where `{knowledge}` appears)
+```
+{{INSIGHTS_SYSTEM_PROMPT}}
+```
+
+### Class Insights tools (read-only)
+`search_logs`, `get_llm_traces`, `get_metrics`, `list_resources`, `get_alarms`, `get_pipeline_runs`,
+`get_document_library`, `get_model_selection` (reads the live AppConfig Model Lab state), `search_project_kb`
+(Bedrock KB over the source code and templates), `get_knowledge_bases` (both KBs' status and syncs) and
+`get_fargate_status` (ECS services and tasks). Their descriptions are sent to the model as Converse `toolConfig`.
+
+---
+
+## 6a. Model Lab: switching the live LLM with AWS AppConfig
+
+**Purpose.** To show that Bedrock lets one application move between vendors' models with no code change. Every
+model is called through the same **Converse API**, so switching is just a different `modelId` (plus small
+per-family request tweaks). Any logged-in student, of either role, can open the **Model Lab** tab in the main app,
+set quality/cost/latency priorities and click **Evaluate & apply**.
+
+**The eight models (6 vendors).** Prices are us-east-2 on-demand rates per 1M tokens from the AWS Price List API.
+For Anthropic, the US cross-region (geo) profile rate is used, which is the one the app calls.
+
+| Model | Vendor | Bedrock ID | $ in / out | Reasoning | Quality prior | Why it's in the catalog |
+|---|---|---|---|---|---|---|
+| Claude Sonnet 4.6 | Anthropic | `us.anthropic.claude-sonnet-4-6` | 3.30 / 16.50 | extended thinking | 95 | Highest quality; the premium end |
+| Claude Haiku 4.5 | Anthropic | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | 1.10 / 5.50 | extended thinking | 85 | Starting model; near-frontier quality, fast |
+| DeepSeek-R1 | DeepSeek | `us.deepseek.r1-v1:0` | 1.35 / 5.40 | native (always reasons) | 82 | Open-weight reasoning model; shows its chain of thought |
+| gpt-oss-120b | OpenAI | `openai.gpt-oss-120b-1:0` | 0.15 / 0.60 | native | 80 | OpenAI open-weight reasoning model; great quality per dollar |
+| Mistral Large 3 | Mistral AI | `mistral.mistral-large-3-675b-instruct` | 0.50 / 1.50 | none | 78 | Large European open-weight model |
+| Llama 4 Maverick 17B | Meta | `us.meta.llama4-maverick-17b-instruct-v1:0` | 0.24 / 0.97 | none | 72 | Mixture-of-experts; very fast and cheap |
+| Amazon Nova Pro | Amazon | `us.amazon.nova-pro-v1:0` | 0.80 / 3.20 | none | 70 | AWS first-party balanced model |
+| Amazon Nova Micro | Amazon | `us.amazon.nova-micro-v1:0` | 0.035 / 0.14 | none | 55 | Cheapest and fastest; text-only |
+
+The account was also probed for other candidates. Nova Premier and Claude 3 Haiku are end-of-life. Claude Haiku 5.5,
+Sonnet 5.x, GPT-5.5 and Grok are not enabled on this account. Palmyra X5 is legacy. Gemma 3 27B worked but took
+about 39 seconds, which is too slow for the 29-second API Gateway limit.
+
+**AppConfig resources (stack `sdge-rag-prod-app`).**
+- Application `sdge-rag-prod`, environment `prod`.
+- A hosted, freeform configuration profile `model-selection`, guarded by a **JSON Schema validator**. AppConfig
+  rejects any version that is missing weights, the active model or the catalog.
+- A custom deployment strategy `sdge-rag-prod-instant`: 0 minutes duration, 0 bake time, 100% growth.
+
+The first version is seeded by `scripts/deploy.sh` from `infra/model-catalog.json`, **only if no version exists**,
+so redeploys never reset what students chose. Each evaluation creates a new hosted version and an AppConfig
+deployment. The version history is therefore a full audit trail, visible in the AppConfig console. The
+configuration document holds: `weights`, `activeModelId`, `selectionPolicy`, `models` (the catalog),
+`lastEvaluation` (measurements, ranking, decision) and `history` (the last 25 changes).
+
+**How the live app picks up a change.** The chat code in the `sdge-rag-prod-api` Fargate service calls the AppConfig
+**data plane** (`StartConfigurationSession` / `GetLatestConfiguration`). It polls at most every 15 seconds per
+container, and an empty response means "unchanged". A switch therefore reaches every container within about
+15 seconds, with no redeploy and no restart. If AppConfig cannot be reached, chat keeps the cached model or falls
+back to Haiku 4.5.
+
+**Evaluation algorithm (`backend/src/model_lab.py`, `POST /api/models/evaluate`).**
+1. **Validate the weights.** They must be integers from 0 to 100 that sum to exactly 100; otherwise the call
+   returns HTTP 400. The UI sliders rebalance the other two proportionally, so the total is always 100.
+2. **Measure.** All 8 models answer 2 test questions in parallel (16 Bedrock calls, about 4 to 15 seconds in total).
+   They use the app's real system prompt and four real document excerpts:
+   - *answerable*: "How often must leak surveys be performed in business districts?" This passes if the answer
+     contains "15 months" and a `[n]` citation.
+   - *must-decline*: a question about an MAOP that is not in the excerpts. This passes if the model says the
+     documents don't contain it and does not invent a psi value.
+
+   Measurements less than 2 minutes old are reused, unless "Re-measure now" is ticked.
+3. **Score** each dimension from 0 to 100, min-max normalised across the 8 models:
+   - Quality = 0.75 × the benchmark-informed prior + 0.25 × the live test score (0, 50 or 100).
+   - Cost = measured input/output tokens × price, on a log scale, where cheaper is better.
+   - Latency = measured mean response time, on a log scale, where faster is better.
+   - Composite = Σ(weight × sub-score) / 100.
+4. **Eligibility.** A model is excluded if its call failed, if it took over 20 s, or if it failed the grounded-answer
+   test. In early runs, gpt-oss-120b often answered correctly but without `[n]` citations, so it was flagged ineligible.
+5. **Decide.** The app switches to the best eligible model only if it beats the live model by **at least 2
+   points** (the hysteresis margin, which prevents flapping), or if the live model has become ineligible. Otherwise
+   it keeps the current model and explains why.
+6. **Write** a new AppConfig version plus a deployment. Optimistic concurrency is handled with
+   `LatestVersionNumber`: if two students click at once, the second is re-decided on top of the first.
+
+**Ranking display.** `GET /api/models` returns the per-model sub-scores, so the browser re-ranks instantly as the
+sliders move ("previewing your unsaved sliders"). The server's ranking for the saved weights is always shown. The
+tab refreshes every 20 seconds, so every student sees changes others make.
+
+**Observability.**
+- Every benchmark call is an `llm_trace` record with `traceType: "model-benchmark"`, including the model's reasoning
+  when it has any. These appear in Class Insights' LLM traces tab, badged "Model Lab benchmark".
+- Each decision is logged as `model_evaluation` with the user, weights, decision and ranking.
+- Each chat trace records `model`, `modelFamily` and `reasoningMode`.
+- The `chat_log` table gained a `model` column.
+- The chat UI shows "answered by <model>".
+
+**Example results** (live measurements, 2026-11-10):
+
+| Weights (Q/C/L) | Winner |
+|---|---|
+| 50/25/25 (default) | Llama 4 Maverick and Claude Sonnet 4.6 were within about 1 point of each other, with Haiku about 4 points behind |
+| 100/0/0 | Claude Sonnet 4.6 |
+| 10/80/10 | Amazon Nova Micro |
+| 20/10/70 | Llama 4 Maverick |
+
+Exact numbers move with each measurement, because latency varies run to run. That variation is a good discussion
+point about why a switch margin is needed.
+
+**IAM.**
+- The API Lambda role may read the configuration through the data plane, and may create versions and start
+  deployments only on this application and its deployment strategy.
+- Class Insights may only read through the data plane.
+- The CodeBuild role may seed the configuration.
+
+---
+
+## 6b. Amazon Bedrock Knowledge Bases (managed RAG)
+
+Two pieces of data in this project fit Bedrock Knowledge Bases well, so each got one. Both use **Amazon S3
+Vectors** as the vector store. S3 Vectors is serverless, has no minimum charge and costs cents at this scale.
+OpenSearch Serverless was ruled out because it costs hundreds of dollars a month even when idle. Both KBs use Titan
+Text Embeddings v2 (1,024 dimensions, float32) and a cosine index.
+
+The index is created with `NonFilterableMetadataKeys: [AMAZON_BEDROCK_TEXT, AMAZON_BEDROCK_METADATA]`. Without
+that, chunk text counts against S3 Vectors' 2 KB filterable-metadata limit and ingestion fails.
+
+| | Gas Ops document library KB | Project corpus KB |
+|---|---|---|
+| Name | `sdge-rag-prod-gasops-docs` (stack `sdge-rag-prod-app`) | `sdge-insights-prod-project-corpus` (stack `sdge-insights-prod-app`) |
+| Data source | `s3://sdge-rag-prod-docs-…/uploads/`: the **same objects** the custom pipeline indexes | `s3://sdge-insights-prod-knowledge-…/kb/`: `design/projectknowledge.md` plus `source/**` (49 files: Lambda code, React code, CloudFormation templates, scripts, buildspecs, README, Model Lab catalog) |
+| Vector store | S3 Vectors bucket `sdge-rag-prod-kb-vectors-<acct>`, index `gasops-docs` | S3 Vectors bucket `sdge-insights-prod-kb-vectors-<acct>`, index `project-corpus` |
+| Chunking | Fixed size, 300 tokens, 20% overlap | Fixed size, 500 tokens, 15% overlap (code needs bigger chunks) |
+| Kept in sync by | The ingest Lambda starts an ingestion job after every upload or re-index. Deleting a document makes the API Lambda invoke the ingest Lambda asynchronously with `{"action":"kb-sync"}`. `scripts/deploy.sh` also syncs. Only one job may run per data source, so `kb.sync()` waits for a running job and then starts a new one, which ensures the latest change is included. | `insights/deploy.sh` rebuilds the source snapshot (`insights/kb_corpus.py` copies files as `.txt`, because KBs don't parse `.py`/`.yaml`, adds a header with the path, and **refuses to publish anything that looks like a credential**) and runs `s3 sync --delete`. The knowledge Lambda writes `kb/design/projectknowledge.md` and starts a sync every time it regenerates (stack changes, every 6 h, every deploy). |
+| Used by | The **Ask** tab has a *Retrieval engine* toggle: **Aurora pgvector (custom pipeline)** or **Bedrock Knowledge Base (managed, S3 Vectors)**. Generation is identical either way (same prompt, same Model Lab model), so students can compare retrieval only. The **Documents** tab shows the KB's recent sync jobs. `GET /api/kb` returns its status. | The Class Insights chatbot's `search_project_kb` tool, for "show me the code / template / IAM policy" questions. The `get_knowledge_bases` tool reports both KBs' status and syncs. |
+
+**Custom pipeline vs. managed KB: talking points.**
+- **Custom (`ingest.py` → Aurora pgvector).** You control the parsing (pypdf, DOCX XML), the heading-aware
+  1,200-character chunks, the SQL and the joins with document metadata. It is also more code to own.
+- **Managed KB.** About 60 lines of glue (`backend/src/kb.py`). Bedrock parses, chunks, embeds, deletes and
+  re-syncs incrementally (unchanged files are skipped). There are fewer knobs, and the results come back as S3 URIs,
+  which the app maps back to its own document IDs.
+- **Similarity scores are not comparable across engines.** In testing, KB scores were about 0.65–0.77 for relevant
+  passages, while pgvector's were about 0.3–0.63. Even an off-topic question returned KB hits above the app's
+  `MIN_SCORE` of 0.15, so on the KB path the LLM's grounding instructions do the "decline" work.
+- **Test results.** Sync time was about 11 s after an upload and about 6 s after a delete. The first hydration
+  indexed 5/5 documents with 0 failures. `scripts/e2e.py kb` tests the full lifecycle: upload → sync → retrieve
+  the new fact → delete → sync → the fact is gone.
+
+**IAM.**
+- Each KB has its own Bedrock service role (trust: `bedrock.amazonaws.com`, conditioned on `aws:SourceAccount`
+  and the KB ARN pattern). The role can invoke Titan v2, read only its own S3 prefix, and read and write only its
+  own vector index.
+- The Gas Ops API/ingest role may `Retrieve` and `StartIngestionJob` only on its own KB.
+- Class Insights may `Retrieve` and sync only the project-corpus KB, and has read-only `List*`/`Get*` access to
+  describe both KBs.
+
+---
+
+## 6c. Containers on AWS Fargate (what moved off Lambda, and why)
+
+On 2026-11-11 three Lambda functions were redeployed as containers on **Amazon ECS with AWS Fargate**. Each shows a
+different Fargate integration pattern. The handler code was **not rewritten**. `backend/src/runtime.py` adapts it,
+playing the role the Lambda runtime used to play.
+
+| Workload | Before | Now on Fargate | How requests/events reach it |
+|---|---|---|---|
+| Gas Ops API (`sdge-rag-prod-api`) | Lambda, 1 GB, 29 s | **ECS service**, 0.5 vCPU / 1 GiB, arm64, desired 1, auto-scales to 4 at 60% CPU | CloudFront → API Gateway **REST** (Cognito authorizer, API key, usage plan unchanged) → **VPC Link** → **internal NLB** (TCP 80 → 8080, health check `/healthz`) → tasks |
+| Document ingest (`sdge-rag-prod-ingest`) | Lambda, 2 GB, 15 min, S3 trigger | **One-off ECS task per document**, 1 vCPU / 2 GiB, arm64 | S3 → **EventBridge** rule → `ecs:RunTask` with `S3_BUCKET`/`S3_KEY` container overrides (input transformer). Re-index/delete: the API calls `ecs:RunTask` |
+| Class Insights chat (`sdge-insights-prod-chat`) | Lambda, 1 GB, 29 s | **ECS service**, 0.25 vCPU / 0.5 GiB, arm64 | API Gateway **HTTP API** (JWT authorizer unchanged) → **VPC Link** → **AWS Cloud Map** SRV records → tasks. **No load balancer at all** |
+
+All three share one ECS cluster, `sdge-rag-prod`. Its capacity providers are FARGATE and FARGATE_SPOT, and the
+default is FARGATE.
+
+**Still on Lambda, and why.**
+- The Cognito triggers (PreSignUp, PostConfirmation) must be Lambda.
+- `dbinit` is a CloudFormation custom resource that runs once per deploy.
+- The Insights `data` and `knowledge` functions are spiky and short-lived, so pay-per-request fits them best.
+
+This split is the main teaching point:
+- **Lambda** suits event-driven, bursty, short work with zero idle cost.
+- **Fargate** suits steady services (no cold starts, connection reuse, warm caches such as the AppConfig and
+  JWKS caches) and long or heavy jobs (no 15-minute limit, up to 16 vCPU / 120 GiB, any language or binary).
+
+**Images.**
+- `backend/Dockerfile` builds one image for the API service and the ingest task. The ingest task overrides the
+  command with `python ingest_task.py`.
+- `insights/backend/Dockerfile` builds the chat image.
+- Both are `python:3.12-slim` from ECR Public, run as a non-root user and serve with **gunicorn** (2 workers × 8
+  threads).
+- They are built **natively on Graviton** by the CodeBuild project `sdge-rag-prod-image-builder` (an ARM
+  container in privileged mode), so no Docker is needed on the deploying machine.
+- Tags are a SHA-256 of each image's inputs. ECR tags are **immutable**, scan-on-push is on, and the 10 newest
+  images are kept.
+
+**What the containers had to provide that Lambda gave for free** (`runtime.py`):
+1. **HTTP server + event adapter.** It turns an HTTP request into the same API Gateway REST (v1) or HTTP API (v2)
+   event the handler expects, so `api.handler` and `chat.handler` are unchanged.
+2. **Lambda-shaped JSON logs.** Without them, metric filters, Logs Insights queries and the trace reader would break.
+3. **Metrics.** EMF is extracted only from Lambda logs, so the containers call `PutMetricData`, scoped by IAM to
+   the `SdgeRag/<env>` namespace.
+4. **JWT verification.** API Gateway still authorizes every request. The container also checks the Cognito token's
+   signature, issuer, expiry and audience against the pool's JWKS, so nothing else in the VPC can call it as a
+   forged user.
+5. **Health checks.** `/healthz` serves the container health check, NLB target health and Cloud Map health.
+
+**Networking.**
+- Tasks run in two new **public** subnets with a public IP, for outbound calls to Bedrock, S3, the RDS Data API
+  and the Cognito JWKS. This avoids a NAT gateway or about 10 interface endpoints.
+- Their security groups admit **no internet traffic**:
+  - API tasks accept port 8080 only from inside the VPC (the internal NLB).
+  - Chat tasks accept traffic only from the VPC Link's security group.
+  - Ingest tasks accept nothing inbound.
+- Aurora stays in the isolated subnets and is still reached only through the Data API.
+
+**Deployments and resilience.**
+- Rolling updates use a minimum of 100% and a maximum of 200%, with the **ECS deployment circuit breaker** and
+  automatic rollback.
+- NLB deregistration delay is 20 s and the task stop timeout is 30 s.
+- The REST API got a new deployment snapshot (`ApiDeploymentV4`) when the integration changed from `AWS_PROXY`
+  (Lambda) to `HTTP_PROXY` over the VPC Link.
+
+**Measured.**
+- An upload's ingest task was created by EventBridge, started 14 s later, indexed the document in about 1 s and
+  exited with code 0 on arm64.
+- Chat latency through the new path was about 3.6 s, essentially all LLM time.
+- The e2e suites passed: smoke 20/20, KB lifecycle 7/7, Insights all checks.
+- Fargate's start-up time (tens of seconds, versus milliseconds for Lambda) is visible in the Documents tab: a new
+  upload sits in "uploading" a little longer before it starts processing.
+
+The live `get_fargate_status` chatbot tool, and the "ECS on Fargate" section of the appendix, show services, task
+sizes, image tags, rollouts and recent (including stopped) tasks.
+
+---
+
+## 7. Observability, including LLM reasoning logs
+
+- **Structured logs**: the Lambdas use Lambda's native **JSON log format**; the Fargate containers use
+  `backend/src/runtime.py`, which emits **the identical JSON shape** to stdout (awslogs driver). Extra fields such as
+  `user`, `docId` and `latencyMs` are top-level JSON keys, so Logs Insights, metric filters and the trace reader work
+  the same on both platforms.
+- **LLM traces**: every Claude call writes one `llm_trace` record.
+  - Main app (`/ecs/sdge-rag-prod-api`; before 2026-11-11 `/aws/lambda/sdge-rag-prod-api`, still read for history): question, system prompt, the exact prompt messages (including
+    retrieved passages), the retrieval table (document, chunk, page, cosine score), the model's **reasoning**
+    (extended thinking text), the response, inference configuration, token usage, stop reason and latency
+    (retrieval, LLM, total).
+  - Class Insights (`/ecs/sdge-insights-prod-chat`; previously `/aws/lambda/sdge-insights-prod-chat`): question, system prompt, every tool call with its
+    input and a result preview, per-round reasoning and text, the final response, usage and latency.
+  - The Class Insights "LLM traces" tab and the `get_llm_traces` tool read these records with CloudWatch Logs
+    `FilterLogEvents`, using the pattern `{ $.message = "llm_trace" }`.
+- **Custom metrics**, namespace `SdgeRag/prod` (EMF log lines on Lambda; `PutMetricData` on Fargate, because CloudWatch
+  only extracts EMF automatically from Lambda logs): ChatRequests, InputTokens, OutputTokens, LlmLatencyMs,
+  RetrievalLatencyMs, RetrievalTopScore, DocumentsIngested, ChunksIndexed, IngestDurationMs, IngestFailures, and
+  ApiErrorLogs (a metric filter on ERROR logs).
+- **Alarms** go to SNS topic `sdge-rag-prod-alerts` (no email subscriber by default). They cover API service
+  error logs, ingest-task failures, the ingestion DLQ, API 5XX, API p90 latency over 20 seconds, **no healthy API
+  task behind the NLB**, Class Insights chat error logs and knowledge-regeneration errors. EventBridge also publishes pipeline failures to the topic.
+- **Dashboard**: CloudWatch dashboard `sdge-rag-prod`.
+- **Tracing**: AWS X-Ray active tracing on the REST API stage and the remaining Lambdas. (The Fargate containers do
+  not run the X-Ray daemon/ADOT sidecar; that would be the next step.)
+- **Access logs**: `/aws/apigateway/sdge-rag-prod-access` and `/aws/apigateway/sdge-insights-prod-access`. These
+  record the user, route, status and latency, and only the API key **ID**, never its value.
+
+---
+
+## 8. Deployment and CI/CD
+
+- **Stacks**: `sdge-rag-prod-edge` (us-east-1), `sdge-rag-prod-app` (us-east-2), `sdge-rag-prod-pipeline`
+  (us-east-2), `sdge-rag-prod-containers` (us-east-2: ECR + image builder), `sdge-insights-prod-edge` (us-east-1) and `sdge-insights-prod-app` (us-east-2). The edge template
+  is shared by both apps through an `AppName` parameter.
+- **`scripts/deploy.sh <env>`** does the following:
+  1. Creates the shared artifacts bucket if it's missing.
+  2. Runs `scripts/build-images.sh`: deploys `sdge-rag-prod-containers` (ECR repos + Graviton CodeBuild builder),
+     hashes each image's inputs, and builds/pushes only images whose hash tag is not already in ECR.
+  3. Builds the Lambda package for the functions that remain on Lambda.
+  4. Deploys the edge stack in us-east-1 and reads its certificate and WAF ARNs.
+  5. Runs `aws cloudformation package` and deploys the app stack in us-east-2 with the image tag (ECS rolls the
+     service; the deployment circuit breaker rolls back automatically if new tasks fail health checks).
+  6. Reads the API key **inside the script** to write the SPA's `config.js`.
+  7. Builds the React app and syncs it to S3 (hashed assets cached for 1 year, `index.html` and `config.js` set to no-cache).
+  8. Invalidates CloudFront and refreshes `projectknowledge.md`.
+- **CodePipeline `sdge-rag-prod`** (V2, queued mode):
+  - **Source**: `scripts/push-source.sh` uploads `source.zip` to a versioned S3 bucket with EventBridge
+    notifications enabled. An EventBridge rule then starts the pipeline.
+  - **Validate**: CodeBuild runs cfn-lint, pyflakes, `py_compile`, `bash -n` and a frontend build.
+  - **Manual approval** (optional per environment).
+  - **Deploy**: CodeBuild runs `scripts/deploy.sh` and passes a CloudFormation **service role**
+    (`sdge-rag-prod-cfn-exec`). The CodeBuild role itself can only drive CloudFormation, pass that role, write to
+    S3 and invalidate CloudFront.
+- **Class Insights** is deployed by the same pipeline (Deploy stage step 2), or by hand with `insights/deploy.sh <env>`. That script fills the verbatim prompts into this
+  narrative, uploads it, deploys the edge and app stacks, publishes the SPA and regenerates `projectknowledge.md`.
+- **Environments**: `infra/env/dev.env` (demo-dev.awsteach.com, DB scales to zero), `staging.env` and `prod.env`.
+  Stack and resource names include the environment, so all three can coexist. Only prod is deployed.
+- **Teardown**: `scripts/destroy.sh <env>` (plus deleting the two insights stacks). It empties buckets, deletes the
+  stacks, removes the ACM validation CNAMEs and lists the final Aurora snapshot that prod keeps.
+
+### Approximate running cost (prod, idle-to-light class use)
+Aurora Serverless v2 at 0.5 ACU is about $1.40 a day. Two WAF web ACLs with their rules cost about $20 a month.
+CloudFront, Lambda, API Gateway, S3, CloudWatch and Bedrock (Haiku plus Titan) cost cents to a few dollars per class.
+Since the Fargate move: two always-on arm64 services (0.5 vCPU/1 GiB and 0.25 vCPU/0.5 GiB) are about $22 a month,
+the internal NLB about $17 a month, per-document ingest tasks fractions of a cent each, and the public IPv4
+addresses on the tasks about $3.65 a month each. The design avoids a NAT gateway (about $33 a month plus data).
+
+---
+
+## 9. Change log
+
+| When (UTC) | Change |
+|---|---|
+| 2026-11-10 18:20 | First deployment attempt. The edge stack succeeded, but the app stack **failed** because SNS requires a unique `Sid` on every topic-policy statement. CloudFormation rolled back automatically. The `Sid`s were added, the rolled-back stack was deleted and the stack was redeployed. A side lesson: `aws cloudformation wait stack-rollback-complete` only matches *update* rollbacks, so it hangs on a failed *create*. |
+| 2026-11-10 ~19:04 | Main app deployed: Aurora, Cognito, REST API, Lambdas, CloudFront, WAF and DNS. Five sample documents were seeded through the real upload path. An end-to-end test of 20 checks passed (roles, RBAC, upload, indexing, retrieval, grounded answers, declining out-of-scope questions). Test users and test chat rows were then removed. |
+| 2026-11-10 ~19:15 | CI/CD pipeline created. The first pipeline run (Source, Validate, Deploy) succeeded. |
+| 2026-11-10 (later) | The "Display name" field was removed from registration (username only, no email). Extended thinking and full `llm_trace` logging were added to the main app's chat. The admin "Insights" tab was renamed **Usage**. A **Class Insights** link was added to the main app header. The **Class Insights** app was deployed: separate stacks, S3 and CloudFront static site, HTTP API with a JWT authorizer, three Lambdas, the knowledge bucket and auto-regeneration of this file. |
+| 2026-11-10 (later) | Lesson learned: the first Class Insights deploy denied `kms:Decrypt` outright. Lambda then could not decrypt the function's **own environment variables** (Lambda uses the execution role for that), so every invocation failed with `KMSAccessDeniedException`. A `kms:ViaService` exemption did not help, because Lambda's environment decryption is not tagged with it. The fix was to drop the redundant KMS deny (the role has no KMS allow anyway) and change an environment variable so Lambda retried the decryption. |
+| 2026-11-10 (later) | CI/CD extended: the pipeline's Deploy stage now also runs `insights/deploy.sh`, and Validate lints and builds the insights code. The first run failed with `AccessDenied` on `s3:PutObject`, because the CodeBuild role only allowed `sdge-rag-*` buckets. Adding `sdge-insights-*` fixed it. This is least privilege working as intended: new resources need explicit grants. |
+| 2026-11-10 ~22:00 | **Model Lab** added. Eight Bedrock models from six vendors, with AWS AppConfig (application, environment, JSON-Schema-validated profile, instant deployment strategy) holding the weights (starting at 50/25/25), the catalog and the active model. The chat API now reads its model from AppConfig every 15 s instead of SSM `chat-model-id`, and only Anthropic models get the extended-thinking field. New endpoints `GET /api/models` and `POST /api/models/evaluate`, a Model Lab tab with three linked sliders, and a live ranking. The e2e test switched the live app to Nova Micro (cost-heavy weights) and then to Sonnet 4.6 (quality-only), confirming chat answered with each model. It was then reset to Haiku 4.5 at 50/25/25. Class Insights gained the `get_model_selection` tool and a Model Lab section in the appendix. |
+| 2026-11-11 | **Two Amazon Bedrock Knowledge Bases** added, both on S3 Vectors with Titan v2. (1) The Gas Ops document library KB over the same S3 objects as the custom pipeline. It is synced on upload, re-index and delete, and the Ask tab gained a retrieval-engine toggle for comparing pgvector with the managed KB. (2) The Class Insights project-corpus KB (design doc, live inventory and a 49-file source/IaC snapshot), searchable via the new `search_project_kb` tool. Lessons: the first deploy failed with `InsufficientCapabilitiesException` because the new role had an explicit `RoleName` (which needs `CAPABILITY_NAMED_IAM`), so the name was dropped. cfn-lint caught a circular dependency (docs bucket → ingest Lambda notification → data source ID → docs bucket); the ingest Lambda now looks up the data source ID at runtime. `chat_log` gained a `retriever` column. |
+| 2026-11-11 (later) | **Moved to AWS Fargate**: the Gas Ops API (ECS service behind API Gateway REST → VPC Link → internal NLB), document ingest (EventBridge → `ecs:RunTask`, one task per document) and the Class Insights chat (ECS service behind HTTP API → VPC Link → Cloud Map). All are arm64/Graviton images built by a new CodeBuild image builder (stack `sdge-rag-prod-containers`, ECR with immutable tags). `runtime.py` keeps logs, metrics, traces and auth identical across Lambda and Fargate. Lessons: the app template grew past CloudFormation's 51,200-byte inline limit, so deploys now upload templates via `--s3-bucket`; the old Lambda log groups were kept so LLM-trace history survives; an `AWS::IAM::Policy` resource was needed for `iam:PassRole` on the task role itself (a role can't reference its own ARN inline). |
+
+---
+
+## 10. Frequently asked questions (quick answers)
+
+- **What LLM is in use?** The Gas Ops assistant uses whatever the Model Lab last selected. Check the appendix or ask
+  the chatbot, which calls `get_model_selection`. It started on Claude Haiku 4.5. The Class Insights chatbot always
+  uses Claude Haiku 4.5. Embeddings use Amazon Titan Text Embeddings v2.
+- **Is there a Bedrock Knowledge Base?** Yes, two (section 6b). In the Gas Ops Ask tab, switch "Retrieval engine" to
+  "Bedrock Knowledge Base" to answer from the managed KB instead of Aurora pgvector.
+- **What runs on Fargate?** The Gas Ops API service, the per-document ingest tasks and the Class Insights chat
+  service (section 6c). Cognito triggers, the DB-schema custom resource and the Insights data/knowledge functions
+  remain on Lambda.
+- **How do I change the LLM?** Open the Model Lab tab in the main app, move the sliders and click "Evaluate &
+  apply". The change is written to AWS AppConfig and is live within about 15 seconds.
+- **Why not Claude 3.5 as the brief said?** Those models are retired on Bedrock. Haiku 4.5 is their direct
+  successor available on this account.
+- **How many AWS resource types are in use?** See the live appendix ("Distinct CloudFormation resource types"), or
+  ask the chatbot, which calls `list_resources` for the current count.
+- **Where is the vector index?** In the `chunks` table of Aurora PostgreSQL, as a `vector(1024)` column with an HNSW index.
+- **Can students see the API key or DB password?** No. Both are used only inside deployment scripts or Lambda.
+  Class Insights' IAM role is explicitly denied access to them.
+- **How do I become an admin?** Register a new account and choose "Administrator". Each account's role is fixed
+  at sign-up; register again to try the other role.
+- **How is projectknowledge.md kept up to date?** The narrative is edited with each new feature. The appendix is
+  regenerated automatically on stack changes, every 6 hours and after each deploy.

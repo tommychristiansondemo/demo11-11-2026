@@ -1,0 +1,1462 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SDGE Gas Ops RAG Assistant - regional APP stack (us-east-2).
+  React SPA (S3 + CloudFront), Cognito, API Gateway (REST, usage plan),
+  Lambda (API + ingestion), Aurora PostgreSQL Serverless v2 + pgvector
+  (via RDS Data API), Bedrock (Claude + Titan Embeddings v2), SSM, Secrets
+  Manager, CloudWatch alarms/dashboard and SNS alerting.
+
+Parameters:
+  EnvName:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  DomainName:
+    Type: String
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN in us-east-1 (from the edge stack)
+  WebAclArn:
+    Type: String
+    Description: CLOUDFRONT-scoped WAF web ACL ARN (from the edge stack)
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+  DbMinCapacity:
+    Type: Number
+    Default: 0.5
+    Description: Aurora Serverless v2 min ACU (0 enables auto-pause; first query after pause is slow)
+  DbMaxCapacity:
+    Type: Number
+    Default: 4
+  ApiRateLimit:
+    Type: Number
+    Default: 20
+    Description: Usage plan steady-state requests/second
+  ApiBurstLimit:
+    Type: Number
+    Default: 40
+  ApiDailyQuota:
+    Type: Number
+    Default: 20000
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email subscribed to the SNS alert topic
+  SamlMetadataUrl:
+    Type: String
+    Default: ""
+    Description: >
+      Optional SAML 2.0 IdP metadata URL (Entra ID, Okta, ADFS, IAM Identity
+      Center). When set, a federated "Sign in with SSO" option is enabled.
+  SamlProviderName:
+    Type: String
+    Default: CorporateSSO
+  AppImageUri:
+    Type: String
+    Description: ECR image (repo:content-hash tag) for the API service and ingest task, built by scripts/build-images.sh
+  ApiDesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 4
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HasSaml: !Not [!Equals [!Ref SamlMetadataUrl, ""]]
+  IsProd: !Equals [!Ref EnvName, prod]
+
+Resources:
+  # ------------------------------------------------------------------
+  # Networking. Isolated subnets for Aurora (reached only through the RDS
+  # Data API). Public subnets for the Fargate tasks: they get a public IP
+  # for outbound calls to AWS APIs (Bedrock, S3, Cognito JWKS...) instead
+  # of a NAT gateway (~$33/month) or ~10 interface endpoints (~$70+/month).
+  # Their security groups allow NO inbound traffic from the internet.
+  # ------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "sdge-rag-${EnvName}" }]
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "sdge-rag-${EnvName}-db-a" }]
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "sdge-rag-${EnvName}-db-b" }]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "sdge-rag-${EnvName}" }]
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "sdge-rag-${EnvName}-tasks-a" }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "sdge-rag-${EnvName}-tasks-b" }]
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "sdge-rag-${EnvName}-public" }]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PublicSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub sdge-rag ${EnvName} Aurora subnets
+      SubnetIds: [!Ref SubnetA, !Ref SubnetB]
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora - no inbound; accessed only through the RDS Data API
+      VpcId: !Ref Vpc
+
+  # ------------------------------------------------------------------
+  # Vector store: Aurora PostgreSQL Serverless v2 + pgvector
+  # ------------------------------------------------------------------
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: !If [IsProd, Snapshot, Delete]
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub sdge-rag-${EnvName}
+      Engine: aurora-postgresql
+      EngineVersion: "16.9"
+      DatabaseName: ragdb
+      MasterUsername: ragadmin
+      ManageMasterUserPassword: true          # password lives in Secrets Manager
+      EnableHttpEndpoint: true                # RDS Data API
+      StorageEncrypted: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref DbSecurityGroup]
+      BackupRetentionPeriod: !If [IsProd, 7, 1]
+      DeletionProtection: false
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref DbMinCapacity
+        MaxCapacity: !Ref DbMaxCapacity
+      Tags: [{ Key: app, Value: sdge-rag }, { Key: env, Value: !Ref EnvName }]
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+
+  # ------------------------------------------------------------------
+  # Configuration (Parameter Store)
+  # ------------------------------------------------------------------
+  ParamEmbedModel:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /sdge-rag/${EnvName}/embedding-model-id
+      Type: String
+      Value: !Ref EmbeddingModelId
+  ParamTopK:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /sdge-rag/${EnvName}/retrieval-top-k
+      Type: String
+      Value: "6"
+  ParamReasoningBudget:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /sdge-rag/${EnvName}/reasoning-budget-tokens
+      Type: String
+      Description: Extended-thinking budget for chat answers (0 disables; >=1024 enables and logs reasoning)
+      Value: "1024"
+  ParamMaxTokens:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /sdge-rag/${EnvName}/max-output-tokens
+      Type: String
+      Value: "1200"
+
+  # ------------------------------------------------------------------
+  # Model Lab: AWS AppConfig holds the LLM catalog, preference weights
+  # and the active model. The initial version is seeded by deploy.sh from
+  # infra/model-catalog.json (so stack updates never reset live choices).
+  # ------------------------------------------------------------------
+  AppConfigApplication:
+    Type: AWS::AppConfig::Application
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}
+      Description: Gas Ops Knowledge Assistant runtime configuration
+  AppConfigEnvironment:
+    Type: AWS::AppConfig::Environment
+    Properties:
+      ApplicationId: !Ref AppConfigApplication
+      Name: !Ref EnvName
+  ModelSelectionProfile:
+    Type: AWS::AppConfig::ConfigurationProfile
+    Properties:
+      ApplicationId: !Ref AppConfigApplication
+      Name: model-selection
+      Description: LLM catalog, quality/cost/latency weights, active model, last evaluation
+      LocationUri: hosted
+      Type: AWS.Freeform
+      Validators:
+        - Type: JSON_SCHEMA
+          Content: |
+            {
+              "$schema": "http://json-schema.org/draft-04/schema#",
+              "type": "object",
+              "required": ["weights", "activeModelId", "models"],
+              "properties": {
+                "weights": {
+                  "type": "object",
+                  "required": ["quality", "cost", "latency"],
+                  "properties": {
+                    "quality": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "cost":    {"type": "integer", "minimum": 0, "maximum": 100},
+                    "latency": {"type": "integer", "minimum": 0, "maximum": 100}
+                  }
+                },
+                "activeModelId": {"type": "string", "minLength": 3},
+                "models": {
+                  "type": "array", "minItems": 2,
+                  "items": {
+                    "type": "object",
+                    "required": ["id", "name", "vendor", "qualityPrior", "pricePer1M"],
+                    "properties": {
+                      "qualityPrior": {"type": "number", "minimum": 0, "maximum": 100},
+                      "pricePer1M": {"type": "object", "required": ["input", "output"]}
+                    }
+                  }
+                }
+              }
+            }
+  InstantDeploymentStrategy:
+    Type: AWS::AppConfig::DeploymentStrategy
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}-instant
+      Description: Model Lab changes take effect immediately (no bake time)
+      DeploymentDurationInMinutes: 0
+      FinalBakeTimeInMinutes: 0
+      GrowthFactor: 100
+      GrowthType: LINEAR
+      ReplicateTo: NONE
+
+  # ------------------------------------------------------------------
+  # Amazon Bedrock Knowledge Base (managed RAG) over the same document
+  # library, stored in Amazon S3 Vectors. Students can compare it with
+  # the hand-built Aurora pgvector pipeline from the Ask tab.
+  # ------------------------------------------------------------------
+  KbVectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      VectorBucketName: !Sub sdge-rag-${EnvName}-kb-vectors-${AWS::AccountId}
+  KbVectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt KbVectorBucket.VectorBucketArn
+      IndexName: gasops-docs
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        # chunk text + Bedrock's metadata blob exceed S3 Vectors' 2 KB filterable-metadata limit
+        NonFilterableMetadataKeys: [AMAZON_BEDROCK_TEXT, AMAZON_BEDROCK_METADATA]
+  KbServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike: { aws:SourceArn: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*" }
+      Policies:
+        - PolicyName: kb-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EmbedWithTitanV2
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+              - Sid: ReadDocumentLibrary
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::sdge-rag-${EnvName}-docs-${AWS::AccountId}-${AWS::Region}/uploads/*
+              - Sid: ListDocumentLibrary
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::sdge-rag-${EnvName}-docs-${AWS::AccountId}-${AWS::Region}
+                Condition: { StringLike: { s3:prefix: ["uploads/*", "uploads"] } }
+              - Sid: VectorIndexReadWrite
+                Effect: Allow
+                Action: [s3vectors:PutVectors, s3vectors:GetVectors, s3vectors:DeleteVectors, s3vectors:QueryVectors,
+                         s3vectors:ListVectors, s3vectors:GetIndex]
+                Resource: !GetAtt KbVectorIndex.IndexArn
+  GasOpsKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}-gasops-docs
+      Description: Gas Ops document library (managed Bedrock RAG over S3 Vectors)
+      RoleArn: !GetAtt KbServiceRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration: { Dimensions: 1024, EmbeddingDataType: FLOAT32 }
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          IndexArn: !GetAtt KbVectorIndex.IndexArn
+  GasOpsDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref GasOpsKnowledgeBase
+      Name: document-library
+      Description: s3://<docs bucket>/uploads/ (the same files the custom pipeline indexes)
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt DocsBucket.Arn
+          InclusionPrefixes: [uploads/]
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration: { MaxTokens: 300, OverlapPercentage: 20 }
+
+  # ------------------------------------------------------------------
+  # Storage
+  # ------------------------------------------------------------------
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sdge-rag-${EnvName}-site-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+          - Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt SiteBucket.Arn, !Sub "${SiteBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+
+  DocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sdge-rag-${EnvName}-docs-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Sub "https://${DomainName}"]
+            AllowedMethods: [PUT]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+      NotificationConfiguration:
+        EventBridgeConfiguration: { EventBridgeEnabled: true }   # rule IngestOnUpload launches a Fargate task
+  DocsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocsBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt DocsBucket.Arn, !Sub "${DocsBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+
+  # ------------------------------------------------------------------
+  # Authentication (Cognito)
+  # ------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub sdge-rag-${EnvName}
+      # Demo environment: minimal password rules, self sign-up, no email
+      # verification (PreSignUp trigger auto-confirms).
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 6
+          RequireLowercase: false
+          RequireUppercase: false
+          RequireNumbers: false
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: false }
+      AutoVerifiedAttributes: []
+      UsernameConfiguration: { CaseSensitive: false }
+      Schema:
+        - Name: role
+          AttributeDataType: String
+          Mutable: false
+          StringAttributeConstraints: { MinLength: "1", MaxLength: "20" }
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpFunction.Arn
+        PostConfirmation: !GetAtt PostConfirmationFunction.Arn
+      UserPoolTags: { app: sdge-rag, env: !Ref EnvName }
+  AdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: admins
+      Description: Knowledge-base administrators (upload/delete documents)
+  EmployeesGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: employees
+      Description: Employees (ask questions)
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub sdge-rag-${EnvName}-${AWS::AccountId}
+  SamlProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: HasSaml
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: !Ref SamlProviderName
+      ProviderType: SAML
+      ProviderDetails: { MetadataURL: !Ref SamlMetadataUrl }
+      AttributeMapping:
+        email: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress
+        name: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: [UserPoolDomain]
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub sdge-rag-${EnvName}-spa
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 7
+      TokenValidityUnits: { AccessToken: minutes, IdToken: minutes, RefreshToken: days }
+      ReadAttributes: [name, custom:role]
+      WriteAttributes: [name, custom:role]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      CallbackURLs: [!Sub "https://${DomainName}/"]
+      LogoutURLs: [!Sub "https://${DomainName}/"]
+      SupportedIdentityProviders: !If
+        - HasSaml
+        - [COGNITO, !Ref SamlProvider]
+        - [COGNITO]
+
+  # ------------------------------------------------------------------
+  # Lambda functions
+  # ------------------------------------------------------------------
+  LambdaBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [lambda.amazonaws.com, ecs-tasks.amazonaws.com] }   # dbinit Lambda + Fargate task role
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: app
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [rds-data:ExecuteStatement, rds-data:BatchExecuteStatement,
+                         rds-data:BeginTransaction, rds-data:CommitTransaction, rds-data:RollbackTransaction]
+                Resource: !GetAtt DbCluster.DBClusterArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt DbCluster.MasterUserSecret.SecretArn
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdge-rag/${EnvName}/*
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - arn:aws:bedrock:*::foundation-model/*
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket, s3:DeleteObjectVersion, s3:ListBucketVersions]
+                Resource:
+                  - !Sub arn:aws:s3:::sdge-rag-${EnvName}-docs-${AWS::AccountId}-${AWS::Region}
+                  - !Sub arn:aws:s3:::sdge-rag-${EnvName}-docs-${AWS::AccountId}-${AWS::Region}/*
+              - Sid: PublishCustomMetrics   # Fargate has no EMF extraction, so metrics use PutMetricData
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition: { StringEquals: { cloudwatch:namespace: !Sub "SdgeRag/${EnvName}" } }
+              - Sid: BedrockKnowledgeBase
+                Effect: Allow
+                Action: [bedrock:Retrieve, bedrock:StartIngestionJob, bedrock:GetIngestionJob, bedrock:ListIngestionJobs,
+                         bedrock:GetKnowledgeBase, bedrock:GetDataSource, bedrock:ListDataSources]
+                Resource: !GetAtt GasOpsKnowledgeBase.KnowledgeBaseArn
+              - Sid: AppConfigReadLive
+                Effect: Allow
+                Action: [appconfig:StartConfigurationSession, appconfig:GetLatestConfiguration]
+                Resource: !Sub arn:aws:appconfig:${AWS::Region}:${AWS::AccountId}:application/${AppConfigApplication}/environment/${AppConfigEnvironment}/configuration/${ModelSelectionProfile}
+              - Sid: AppConfigModelLabWrite
+                Effect: Allow
+                Action: [appconfig:ListHostedConfigurationVersions, appconfig:GetHostedConfigurationVersion,
+                         appconfig:CreateHostedConfigurationVersion, appconfig:StartDeployment, appconfig:GetDeployment]
+                Resource:
+                  - !Sub arn:aws:appconfig:${AWS::Region}:${AWS::AccountId}:application/${AppConfigApplication}
+                  - !Sub arn:aws:appconfig:${AWS::Region}:${AWS::AccountId}:application/${AppConfigApplication}/*
+                  - !Sub arn:aws:appconfig:${AWS::Region}:${AWS::AccountId}:deploymentstrategy/${InstantDeploymentStrategy}
+
+  PreSignUpFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub sdge-rag-${EnvName}-presignup
+      Runtime: python3.12
+      Handler: cognito_triggers.pre_signup
+      Code: ../backend/build
+      Role: !GetAtt LambdaBaseRole.Arn
+      Timeout: 5
+      LoggingConfig: { LogFormat: JSON, LogGroup: !Ref PreSignUpLogs }
+  PreSignUpLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/sdge-rag-${EnvName}-presignup
+      RetentionInDays: !Ref LogRetentionDays
+  PreSignUpPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PreSignUpFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  PostConfirmationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  PostConfirmationPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: add-to-group
+      Roles: [!Ref PostConfirmationRole]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: cognito-idp:AdminAddUserToGroup
+            Resource: !GetAtt UserPool.Arn
+  PostConfirmationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub sdge-rag-${EnvName}-postconfirm
+      Runtime: python3.12
+      Handler: cognito_triggers.post_confirmation
+      Code: ../backend/build
+      Role: !GetAtt PostConfirmationRole.Arn
+      Timeout: 10
+      LoggingConfig: { LogFormat: JSON, LogGroup: !Ref PostConfirmationLogs }
+  PostConfirmationLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/sdge-rag-${EnvName}-postconfirm
+      RetentionInDays: !Ref LogRetentionDays
+  PostConfirmationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PostConfirmationFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # ------------------------------------------------------------------
+  # Compute: Amazon ECS on AWS Fargate (Graviton / arm64)
+  #   * API service: REST API Gateway -> VPC Link -> internal NLB -> tasks
+  #   * Ingest: S3 -> EventBridge -> ecs:RunTask (one task per document)
+  # (Until 2026-11-11 both ran on Lambda; their old log groups are kept.)
+  # ------------------------------------------------------------------
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub sdge-rag-${EnvName}
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      DefaultCapacityProviderStrategy: [{ CapacityProvider: FARGATE, Weight: 1 }]
+      ClusterSettings: [{ Name: containerInsights, Value: disabled }]
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+  RunIngestTasksPolicy:     # separate resource: it references AppRole's own ARN (PassRole)
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: run-ingest-tasks
+      Roles: [!Ref AppRole]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: ecs:RunTask
+            Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/sdge-rag-${EnvName}-ingest:*
+            Condition: { ArnEquals: { ecs:cluster: !GetAtt EcsCluster.Arn } }
+          - Effect: Allow
+            Action: ecs:TagResource
+            Resource: "*"
+            Condition: { StringEquals: { ecs:CreateAction: RunTask } }
+          - Effect: Allow
+            Action: iam:PassRole
+            Resource: [!GetAtt AppRole.Arn, !GetAtt TaskExecutionRole.Arn]
+            Condition: { StringEquals: { iam:PassedToService: ecs-tasks.amazonaws.com } }
+
+  ApiTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API tasks - port 8080 from inside the VPC only (the NLB); nothing from the internet
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 10.42.0.0/16, Description: internal NLB }
+  IngestTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Ingest tasks - outbound only
+      VpcId: !Ref Vpc
+
+  ApiServiceLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/sdge-rag-${EnvName}-api
+      RetentionInDays: !Ref LogRetentionDays
+  IngestTaskLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/sdge-rag-${EnvName}-ingest
+      RetentionInDays: !Ref LogRetentionDays
+  ApiLogs:              # legacy: the API's Lambda-era log group (history kept for Class Insights)
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/sdge-rag-${EnvName}-api
+      RetentionInDays: !Ref LogRetentionDays
+  IngestLogs:           # legacy: the ingest Lambda's log group
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/sdge-rag-${EnvName}-ingest
+      RetentionInDays: !Ref LogRetentionDays
+
+  ApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub sdge-rag-${EnvName}-api
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt AppRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Ref AppImageUri
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          StopTimeout: 30
+          HealthCheck:
+            Command: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 20
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ApiServiceLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+          Environment:
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: ENV_NAME, Value: !Ref EnvName }
+            - { Name: DB_CLUSTER_ARN, Value: !GetAtt DbCluster.DBClusterArn }
+            - { Name: DB_SECRET_ARN, Value: !GetAtt DbCluster.MasterUserSecret.SecretArn }
+            - { Name: DB_NAME, Value: ragdb }
+            - { Name: DOCS_BUCKET, Value: !Sub "sdge-rag-${EnvName}-docs-${AWS::AccountId}-${AWS::Region}" }
+            - { Name: PARAM_PREFIX, Value: !Sub "/sdge-rag/${EnvName}/" }
+            - { Name: APPCONFIG_APP_ID, Value: !Ref AppConfigApplication }
+            - { Name: APPCONFIG_ENV_ID, Value: !Ref AppConfigEnvironment }
+            - { Name: APPCONFIG_PROFILE_ID, Value: !Ref ModelSelectionProfile }
+            - { Name: APPCONFIG_STRATEGY_ID, Value: !Ref InstantDeploymentStrategy }
+            - { Name: DEFAULT_MODEL_ID, Value: us.anthropic.claude-haiku-4-5-20251001-v1:0 }
+            - { Name: KB_ID, Value: !Ref GasOpsKnowledgeBase }
+            - { Name: KB_DATA_SOURCE_ID, Value: !GetAtt GasOpsDataSource.DataSourceId }
+            - { Name: USER_POOL_ID, Value: !Ref UserPool }
+            - { Name: USER_POOL_CLIENT_ID, Value: !Ref UserPoolClient }
+            - { Name: ECS_CLUSTER, Value: !Ref EcsCluster }
+            - { Name: INGEST_TASK_FAMILY, Value: !Sub "sdge-rag-${EnvName}-ingest" }
+            - { Name: TASK_SUBNETS, Value: !Sub "${PublicSubnetA},${PublicSubnetB}" }
+            - { Name: INGEST_SECURITY_GROUP, Value: !Ref IngestTaskSecurityGroup }
+  IngestTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub sdge-rag-${EnvName}-ingest
+      Cpu: "1024"
+      Memory: "2048"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt AppRole.Arn
+      ContainerDefinitions:
+        - Name: ingest
+          Image: !Ref AppImageUri
+          Essential: true
+          Command: [python, ingest_task.py]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref IngestTaskLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ingest
+          Environment:
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: ENV_NAME, Value: !Ref EnvName }
+            - { Name: DB_CLUSTER_ARN, Value: !GetAtt DbCluster.DBClusterArn }
+            - { Name: DB_SECRET_ARN, Value: !GetAtt DbCluster.MasterUserSecret.SecretArn }
+            - { Name: DB_NAME, Value: ragdb }
+            - { Name: DOCS_BUCKET, Value: !Sub "sdge-rag-${EnvName}-docs-${AWS::AccountId}-${AWS::Region}" }
+            - { Name: PARAM_PREFIX, Value: !Sub "/sdge-rag/${EnvName}/" }
+            - { Name: KB_ID, Value: !Ref GasOpsKnowledgeBase }
+            - { Name: KB_DATA_SOURCE_ID, Value: !GetAtt GasOpsDataSource.DataSourceId }
+            - { Name: APPCONFIG_APP_ID, Value: !Ref AppConfigApplication }
+            - { Name: APPCONFIG_ENV_ID, Value: !Ref AppConfigEnvironment }
+            - { Name: APPCONFIG_PROFILE_ID, Value: !Ref ModelSelectionProfile }
+            - { Name: APPCONFIG_STRATEGY_ID, Value: !Ref InstantDeploymentStrategy }
+
+  ApiNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}-api
+      Type: network
+      Scheme: internal      # reachable only through the API Gateway VPC Link
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      LoadBalancerAttributes: [{ Key: load_balancing.cross_zone.enabled, Value: "true" }]
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}-api
+      TargetType: ip
+      Protocol: TCP
+      Port: 8080
+      VpcId: !Ref Vpc
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes: [{ Key: deregistration_delay.timeout_seconds, Value: "20" }]
+  ApiNlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApiNlb
+      Port: 80
+      Protocol: TCP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref ApiTargetGroup }]
+  ApiVpcLink:
+    Type: AWS::ApiGateway::VpcLink
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}-api
+      Description: REST API -> internal NLB -> Fargate API service
+      TargetArns: [!Ref ApiNlb]
+
+  ApiService:
+    Type: AWS::ECS::Service
+    DependsOn: ApiNlbListener
+    Properties:
+      ServiceName: !Sub sdge-rag-${EnvName}-api
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref ApiTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref ApiDesiredCount
+      HealthCheckGracePeriodSeconds: 40
+      PropagateTags: SERVICE
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100     # rolling deploys never drop below the desired count
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref ApiTaskSecurityGroup]
+          AssignPublicIp: ENABLED
+      LoadBalancers: [{ ContainerName: api, ContainerPort: 8080, TargetGroupArn: !Ref ApiTargetGroup }]
+  ApiScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub service/${EcsCluster}/${ApiService.Name}
+      MinCapacity: !Ref ApiDesiredCount
+      MaxCapacity: 4
+  ApiCpuScaling:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub sdge-rag-${EnvName}-api-cpu60
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ApiScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification: { PredefinedMetricType: ECSServiceAverageCPUUtilization }
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+
+  IngestDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub sdge-rag-${EnvName}-ingest-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  IngestDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref IngestDlq]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestDlq.Arn
+            Condition: { ArnEquals: { aws:SourceArn: !GetAtt IngestOnUpload.Arn } }
+  EventsRunTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { aws:SourceAccount: !Ref AWS::AccountId } }
+      Policies:
+        - PolicyName: run-ingest-task
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/sdge-rag-${EnvName}-ingest:*
+                Condition: { ArnEquals: { ecs:cluster: !GetAtt EcsCluster.Arn } }
+              - Effect: Allow
+                Action: ecs:TagResource
+                Resource: "*"
+                Condition: { StringEquals: { ecs:CreateAction: RunTask } }
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt AppRole.Arn, !GetAtt TaskExecutionRole.Arn]
+                Condition: { StringEquals: { iam:PassedToService: ecs-tasks.amazonaws.com } }
+  IngestOnUpload:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}-ingest-on-upload
+      Description: New document in s3://docs/uploads/ -> run one Fargate ingest task
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket: { name: [!Sub "sdge-rag-${EnvName}-docs-${AWS::AccountId}-${AWS::Region}"] }
+          object: { key: [{ prefix: uploads/ }] }
+      Targets:
+        - Id: ingest-task
+          Arn: !GetAtt EcsCluster.Arn
+          RoleArn: !GetAtt EventsRunTaskRole.Arn
+          EcsParameters:
+            TaskDefinitionArn: !Ref IngestTaskDefinition
+            TaskCount: 1
+            LaunchType: FARGATE
+            PlatformVersion: LATEST
+            PropagateTags: TASK_DEFINITION
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+                SecurityGroups: [!Ref IngestTaskSecurityGroup]
+                AssignPublicIp: ENABLED
+          InputTransformer:
+            InputPathsMap: { bucket: $.detail.bucket.name, key: $.detail.object.key }
+            InputTemplate: |
+              {"containerOverrides": [{"name": "ingest", "environment": [{"name": "S3_BUCKET", "value": <bucket>}, {"name": "S3_KEY", "value": <key>}]}]}
+          RetryPolicy: { MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 3600 }
+          DeadLetterConfig: { Arn: !GetAtt IngestDlq.Arn }
+
+  # Custom resource: create pgvector extension + schema once the DB is up
+  DbInitFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub sdge-rag-${EnvName}-dbinit
+      Runtime: python3.12
+      Handler: dbinit.handler
+      Code: ../backend/build
+      Role: !GetAtt AppRole.Arn
+      Timeout: 600
+      LoggingConfig: { LogFormat: JSON, LogGroup: !Ref DbInitLogs }
+      Environment:
+        Variables:
+          DB_CLUSTER_ARN: !GetAtt DbCluster.DBClusterArn
+          DB_SECRET_ARN: !GetAtt DbCluster.MasterUserSecret.SecretArn
+          DB_NAME: ragdb
+  DbInitLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/sdge-rag-${EnvName}-dbinit
+      RetentionInDays: !Ref LogRetentionDays
+  DbSchema:
+    Type: Custom::DbSchema
+    DependsOn: DbInstance
+    Properties:
+      ServiceToken: !GetAtt DbInitFunction.Arn
+      SchemaVersion: "5"
+
+  # ------------------------------------------------------------------
+  # API Gateway (REST) - Cognito authorizer, API key + usage plan
+  # ------------------------------------------------------------------
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}
+      Description: SDGE Gas Ops RAG assistant API
+      EndpointConfiguration: { Types: [REGIONAL] }
+      ApiKeySourceType: HEADER
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      RestApiId: !Ref RestApi
+      Name: cognito
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs: [!GetAtt UserPool.Arn]
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: api
+  ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResource
+      PathPart: "{proxy+}"
+  ProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ProxyResource
+      HttpMethod: ANY
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      ApiKeyRequired: true
+      RequestParameters: { method.request.path.proxy: true }
+      Integration:
+        Type: HTTP_PROXY                 # forwards method, path, query, headers (incl. Authorization) and body
+        IntegrationHttpMethod: ANY
+        ConnectionType: VPC_LINK
+        ConnectionId: !Ref ApiVpcLink
+        Uri: !Sub http://${ApiNlb.DNSName}/api/{proxy}
+        RequestParameters: { integration.request.path.proxy: method.request.path.proxy }
+        TimeoutInMillis: 29000
+  GatewayResponse4xx:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref RestApi
+      ResponseType: DEFAULT_4XX
+      ResponseTemplates:
+        application/json: '{"error":"$context.error.messageString","type":"$context.error.responseType","requestId":"$context.requestId"}'
+  GatewayResponse5xx:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref RestApi
+      ResponseType: DEFAULT_5XX
+      ResponseTemplates:
+        application/json: '{"error":"$context.error.messageString","type":"$context.error.responseType","requestId":"$context.requestId"}'
+
+  ApiDeploymentV4:        # new logical ID => new deployment snapshot whenever the integration changes
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [ProxyMethod, GatewayResponse4xx, GatewayResponse5xx]
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: v4 - Fargate via VPC Link
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/sdge-rag-${EnvName}-access
+      RetentionInDays: !Ref LogRetentionDays
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: ApiGatewayAccount
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeploymentV4
+      StageName: !Ref EnvName
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogs.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","user":"$context.authorizer.claims.cognito:username","method":"$context.httpMethod","path":"$context.path","status":"$context.status","latencyMs":"$context.responseLatency","integrationLatencyMs":"$context.integrationLatency","apiKeyId":"$context.identity.apiKeyId","error":"$context.error.message"}'
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: !Ref ApiRateLimit
+          ThrottlingBurstLimit: !Ref ApiBurstLimit
+          MetricsEnabled: true
+          LoggingLevel: ERROR
+          DataTraceEnabled: false
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiStage
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}-spa
+      Description: Key identifying the web client for usage-plan metering/throttling
+      Enabled: true
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiStage
+    Properties:
+      UsagePlanName: !Sub sdge-rag-${EnvName}-standard
+      ApiStages: [{ ApiId: !Ref RestApi, Stage: !Ref EnvName }]
+      Throttle: { RateLimit: !Ref ApiRateLimit, BurstLimit: !Ref ApiBurstLimit }
+      Quota: { Limit: !Ref ApiDailyQuota, Period: DAY }
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # ------------------------------------------------------------------
+  # CloudFront (SPA + /api/* routed to API Gateway, same origin => no CORS)
+  # ------------------------------------------------------------------
+  SiteOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub sdge-rag-${EnvName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  SpaRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}-spa-rewrite
+      AutoPublish: true
+      FunctionConfig: { Comment: SPA fallback to index.html, Runtime: cloudfront-js-2.0 }
+      FunctionCode: |
+        function handler(event) {
+          var r = event.request;
+          if (r.uri === '/' || r.uri.indexOf('.') === -1) { r.uri = '/index.html'; }
+          return r;
+        }
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub sdge-rag-${EnvName}-security
+        SecurityHeadersConfig:
+          StrictTransportSecurity: { AccessControlMaxAgeSec: 31536000, IncludeSubdomains: false, Override: true }
+          ContentTypeOptions: { Override: true }
+          FrameOptions: { FrameOption: DENY, Override: true }
+          ReferrerPolicy: { ReferrerPolicy: strict-origin-when-cross-origin, Override: true }
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://cognito-idp.${AWS::Region}.amazonaws.com https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com https://sdge-rag-${EnvName}-docs-${AWS::AccountId}-${AWS::Region}.s3.${AWS::Region}.amazonaws.com; frame-ancestors 'none'"
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub sdge-rag ${EnvName} (${DomainName})
+        Aliases: [!Ref DomainName]
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        WebACLId: !Ref WebAclArn
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOac.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+          - Id: api
+            DomainName: !Sub ${RestApi}.execute-api.${AWS::Region}.amazonaws.com
+            OriginPath: !Sub /${EnvName}
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRewriteFunction.FunctionMetadata.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad        # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+      Tags: [{ Key: app, Value: sdge-rag }, { Key: env, Value: !Ref EnvName }]
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2   # CloudFront
+  DnsRecordAaaa:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  # ------------------------------------------------------------------
+  # Monitoring & alerting
+  # ------------------------------------------------------------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub sdge-rag-${EnvName}-alerts
+      DisplayName: SDGE RAG alerts
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition: { ArnLike: { aws:SourceArn: !Sub "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*" } }
+          - Sid: AllowEventBridge
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition: { ArnLike: { aws:SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*" } }
+  AlertEmailSub:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  ApiServiceErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sdge-rag-${EnvName}-api-service-errors
+      AlarmDescription: The Fargate API service is logging errors
+      Namespace: !Sub SdgeRag/${EnvName}
+      MetricName: ApiErrorLogs
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+  IngestFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sdge-rag-${EnvName}-ingest-failures
+      AlarmDescription: A Fargate ingest task failed to index a document
+      Namespace: !Sub SdgeRag/${EnvName}
+      MetricName: IngestFailures
+      Dimensions: [{ Name: Service, Value: ingest }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  IngestDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sdge-rag-${EnvName}-ingest-dlq
+      AlarmDescription: Ingestion events landed in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt IngestDlq.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sdge-rag-${EnvName}-api-5xx
+      AlarmDescription: API Gateway 5XX responses
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions: [{ Name: ApiName, Value: !Sub "sdge-rag-${EnvName}" }, { Name: Stage, Value: !Ref EnvName }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sdge-rag-${EnvName}-api-latency-p90
+      AlarmDescription: p90 API latency above 20s (approaching the 29s integration limit)
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions: [{ Name: ApiName, Value: !Sub "sdge-rag-${EnvName}" }, { Name: Stage, Value: !Ref EnvName }]
+      ExtendedStatistic: p90
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 20000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  ApiHealthyTasksAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sdge-rag-${EnvName}-api-no-healthy-tasks
+      AlarmDescription: No healthy Fargate API task behind the NLB
+      Namespace: AWS/NetworkELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt ApiNlb.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt ApiTargetGroup.TargetGroupFullName }
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+  ErrorLogMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiServiceLogs
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub SdgeRag/${EnvName}
+          MetricName: ApiErrorLogs
+          MetricValue: "1"
+          DefaultValue: 0
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub sdge-rag-${EnvName}
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"text","x":0,"y":0,"width":24,"height":1,"properties":{"markdown":"## SDGE Gas Ops RAG Assistant - ${EnvName}"}},
+            {"type":"metric","x":0,"y":1,"width":8,"height":6,"properties":{"title":"API requests / errors","region":"${AWS::Region}","stat":"Sum","period":300,
+              "metrics":[["AWS/ApiGateway","Count","ApiName","sdge-rag-${EnvName}","Stage","${EnvName}"],[".","4XXError",".",".",".","."],[".","5XXError",".",".",".","."]]}},
+            {"type":"metric","x":8,"y":1,"width":8,"height":6,"properties":{"title":"API latency (ms)","region":"${AWS::Region}","period":300,
+              "metrics":[["AWS/ApiGateway","Latency","ApiName","sdge-rag-${EnvName}","Stage","${EnvName}",{"stat":"p50"}],["...",{"stat":"p90"}],["...",{"stat":"Maximum"}]]}},
+            {"type":"metric","x":16,"y":1,"width":8,"height":6,"properties":{"title":"Chat questions & tokens","region":"${AWS::Region}","stat":"Sum","period":300,
+              "metrics":[["SdgeRag/${EnvName}","ChatRequests","Service","api"],[".","InputTokens",".","."],[".","OutputTokens",".","."]]}},
+            {"type":"metric","x":0,"y":7,"width":8,"height":6,"properties":{"title":"Fargate API service CPU / memory %","region":"${AWS::Region}","stat":"Average","period":60,
+              "metrics":[["AWS/ECS","CPUUtilization","ClusterName","${EcsCluster}","ServiceName","sdge-rag-${EnvName}-api"],[".","MemoryUtilization",".",".",".","."]]}},
+            {"type":"metric","x":8,"y":7,"width":8,"height":6,"properties":{"title":"NLB healthy API tasks / errors logged","region":"${AWS::Region}","period":60,
+              "metrics":[["AWS/NetworkELB","HealthyHostCount","TargetGroup","${ApiTargetGroup.TargetGroupFullName}","LoadBalancer","${ApiNlb.LoadBalancerFullName}",{"stat":"Minimum"}],["SdgeRag/${EnvName}","ApiErrorLogs",{"stat":"Sum","yAxis":"right"}]]}},
+            {"type":"metric","x":16,"y":7,"width":8,"height":6,"properties":{"title":"Docs ingested / chunks","region":"${AWS::Region}","stat":"Sum","period":300,
+              "metrics":[["SdgeRag/${EnvName}","DocumentsIngested","Service","ingest"],[".","ChunksIndexed",".","."],[".","IngestFailures",".","."]]}},
+            {"type":"metric","x":0,"y":13,"width":8,"height":6,"properties":{"title":"Aurora ACU utilization","region":"${AWS::Region}","stat":"Average","period":300,
+              "metrics":[["AWS/RDS","ServerlessDatabaseCapacity","DBClusterIdentifier","sdge-rag-${EnvName}"],[".","ACUUtilization",".","."]]}},
+            {"type":"metric","x":8,"y":13,"width":8,"height":6,"properties":{"title":"Retrieval top score / LLM latency","region":"${AWS::Region}","period":300,
+              "metrics":[["SdgeRag/${EnvName}","RetrievalTopScore","Service","api",{"stat":"Average"}],[".","LlmLatencyMs",".",".",{"stat":"p90","yAxis":"right"}]]}},
+            {"type":"log","x":16,"y":13,"width":8,"height":6,"properties":{"title":"Recent errors","region":"${AWS::Region}",
+              "query":"SOURCE '/ecs/sdge-rag-${EnvName}-api' | SOURCE '/ecs/sdge-rag-${EnvName}-ingest' | fields @timestamp, message, error | filter level = 'ERROR' | sort @timestamp desc | limit 20","view":"table"}}
+          ]
+        }
+
+Outputs:
+  SiteUrl:
+    Value: !Sub https://${DomainName}
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  DocsBucketName:
+    Value: !Ref DocsBucket
+  DistributionId:
+    Value: !Ref Distribution
+  DistributionDomain:
+    Value: !GetAtt Distribution.DomainName
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Value: !Sub ${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+  SsoProviderName:
+    Value: !If [HasSaml, !Ref SamlProviderName, ""]
+  ApiId:
+    Value: !Ref RestApi
+  ApiKeyId:
+    Value: !Ref ApiKey
+  VpcId:
+    Value: !Ref Vpc
+  TaskSubnetIds:
+    Value: !Sub ${PublicSubnetA},${PublicSubnetB}
+  EcsClusterName:
+    Value: !Ref EcsCluster
+  EcsClusterArn:
+    Value: !GetAtt EcsCluster.Arn
+  ApiServiceName:
+    Value: !GetAtt ApiService.Name
+  IngestTaskFamily:
+    Value: !Sub sdge-rag-${EnvName}-ingest
+  IngestSecurityGroupId:
+    Value: !Ref IngestTaskSecurityGroup
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+  KnowledgeBaseId:
+    Value: !Ref GasOpsKnowledgeBase
+  KnowledgeBaseDataSourceId:
+    Value: !GetAtt GasOpsDataSource.DataSourceId
+  KbVectorBucketName:
+    Value: !Sub sdge-rag-${EnvName}-kb-vectors-${AWS::AccountId}
+  AppConfigApplicationId:
+    Value: !Ref AppConfigApplication
+  AppConfigEnvironmentId:
+    Value: !Ref AppConfigEnvironment
+  ModelSelectionProfileId:
+    Value: !Ref ModelSelectionProfile
+  AppConfigStrategyId:
+    Value: !Ref InstantDeploymentStrategy
+  ApiInvokeUrl:
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvName}
+  DbClusterArn:
+    Value: !GetAtt DbCluster.DBClusterArn
+  DbSecretArn:
+    Value: !GetAtt DbCluster.MasterUserSecret.SecretArn
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=sdge-rag-${EnvName}

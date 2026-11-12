@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SDGE Gas Ops RAG Assistant - CI/CD (CodePipeline V2) for one environment.
+  Source: a zip uploaded to the source bucket (scripts/push-source.sh) triggers
+  the pipeline via EventBridge. Stages: Source -> Validate -> [Approval] -> Deploy.
+  Swap the S3 source action for a CodeConnections (GitHub/GitLab/Bitbucket)
+  source once a connection is authorized in the console.
+
+Parameters:
+  EnvName:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  RequireApproval:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  ApprovalTopicArn:
+    Type: String
+    Default: ""
+    Description: Optional SNS topic notified when a manual approval is pending
+
+Conditions:
+  NeedsApproval: !Equals [!Ref RequireApproval, "true"]
+  HasApprovalTopic: !Not [!Equals [!Ref ApprovalTopicArn, ""]]
+
+Resources:
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sdge-rag-${EnvName}-source-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration: { Status: Enabled }
+      NotificationConfiguration:
+        EventBridgeConfiguration: { EventBridgeEnabled: true }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - { Id: old-versions, Status: Enabled, NoncurrentVersionExpiration: { NoncurrentDays: 30 } }
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sdge-rag-${EnvName}-pipeline-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire, Status: Enabled, ExpirationInDays: 30 }
+
+  # Service role CloudFormation assumes to create/update the app stacks.
+  # It must be able to create IAM roles, Lambda, RDS, CloudFront, etc.
+  CfnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub sdge-rag-${EnvName}-cfn-exec
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AdministratorAccess]
+
+  # CodeBuild itself is limited to orchestration: it can drive CloudFormation
+  # (passing the execution role), publish the SPA and invalidate CloudFront.
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/sdge-rag-${EnvName}-*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:DeleteObject, s3:ListBucket,
+                         s3:GetBucketLocation, s3:CreateBucket, s3:PutBucketPublicAccessBlock, s3:PutLifecycleConfiguration]
+                Resource: [arn:aws:s3:::sdge-rag-*, arn:aws:s3:::sdge-rag-*/*, arn:aws:s3:::sdge-insights-*, arn:aws:s3:::sdge-insights-*/*]
+              - Effect: Allow
+                Action: [cloudformation:CreateChangeSet, cloudformation:ExecuteChangeSet, cloudformation:DescribeChangeSet,
+                         cloudformation:DeleteChangeSet, cloudformation:DescribeStacks, cloudformation:DescribeStackEvents,
+                         cloudformation:GetTemplateSummary, cloudformation:ValidateTemplate, cloudformation:CreateStack,
+                         cloudformation:UpdateStack, cloudformation:ListStacks]
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecutionRole.Arn
+              - Effect: Allow
+                Action: [cloudfront:CreateInvalidation, apigateway:GET, route53:ListHostedZonesByName, sts:GetCallerIdentity]
+                Resource: "*"
+              - Effect: Allow
+                Action: [lambda:GetFunction, lambda:InvokeFunction]
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:sdge-insights-${EnvName}-knowledge
+              - Sid: BuildContainerImages     # scripts/build-images.sh drives the Graviton image-builder project
+                Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/sdge-rag-${EnvName}-image-builder
+              - Effect: Allow
+                Action: ecr:DescribeImages
+                Resource:
+                  - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/sdge-rag-${EnvName}-app
+                  - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/sdge-insights-${EnvName}-chat
+              - Sid: SeedModelLabTask          # one-off Fargate task on a fresh environment
+                Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/sdge-rag-${EnvName}-ingest:*
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/sdge-rag-${EnvName}-app-*
+                Condition: { StringEquals: { iam:PassedToService: ecs-tasks.amazonaws.com } }
+              - Sid: SyncKnowledgeBases
+                Effect: Allow
+                Action: [bedrock:StartIngestionJob, bedrock:ListIngestionJobs, bedrock:GetIngestionJob]
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*
+              - Sid: SeedModelLabConfig
+                Effect: Allow
+                Action: [appconfig:ListHostedConfigurationVersions, appconfig:CreateHostedConfigurationVersion, appconfig:StartDeployment]
+                Resource: !Sub arn:aws:appconfig:${AWS::Region}:${AWS::AccountId}:*
+
+  ValidateProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}-validate
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: buildspec-validate.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+      TimeoutInMinutes: 15
+      LogsConfig: { CloudWatchLogs: { Status: ENABLED, GroupName: !Sub "/aws/codebuild/sdge-rag-${EnvName}-validate" } }
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}-deploy
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: buildspec.yml }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: ENV_NAME, Value: !Ref EnvName }
+          - { Name: CFN_ROLE_ARN, Value: !GetAtt CfnExecutionRole.Arn }
+      TimeoutInMinutes: 60
+      LogsConfig: { CloudWatchLogs: { Status: ENABLED, GroupName: !Sub "/aws/codebuild/sdge-rag-${EnvName}-deploy" } }
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:GetBucketVersioning, s3:PutObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt SourceBucket.Arn
+                  - !Sub ${SourceBucket.Arn}/*
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: [!GetAtt ValidateProject.Arn, !GetAtt DeployProject.Arn]
+              - !If
+                - HasApprovalTopic
+                - { Effect: Allow, Action: sns:Publish, Resource: !Ref ApprovalTopicArn }
+                - !Ref AWS::NoValue
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore: { Type: S3, Location: !Ref ArtifactBucket }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: S3, Version: "1" }
+              Configuration:
+                S3Bucket: !Ref SourceBucket
+                S3ObjectKey: source.zip
+                PollForSourceChanges: false
+              OutputArtifacts: [{ Name: src }]
+        - Name: Validate
+          Actions:
+            - Name: LintAndBuild
+              ActionTypeId: { Category: Test, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref ValidateProject }
+              InputArtifacts: [{ Name: src }]
+        - !If
+          - NeedsApproval
+          - Name: Approve
+            Actions:
+              - Name: ManualApproval
+                ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+                Configuration:
+                  CustomData: !Sub Approve deployment to ${EnvName}
+                  NotificationArn: !If [HasApprovalTopic, !Ref ApprovalTopicArn, !Ref AWS::NoValue]
+          - !Ref AWS::NoValue
+        - Name: Deploy
+          Actions:
+            - Name: DeployStacksAndSite
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref DeployProject }
+              InputArtifacts: [{ Name: src }]
+
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+  TriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Start the pipeline when a new source.zip is uploaded
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket: { name: [!Ref SourceBucket] }
+          object: { key: [source.zip] }
+      Targets:
+        - Id: pipeline
+          Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+          RoleArn: !GetAtt TriggerRole.Arn
+
+  PipelineFailedRule:
+    Type: AWS::Events::Rule
+    Condition: HasApprovalTopic
+    Properties:
+      Description: Notify on pipeline failure
+      EventPattern:
+        source: [aws.codepipeline]
+        detail-type: [CodePipeline Pipeline Execution State Change]
+        detail: { pipeline: [!Ref Pipeline], state: [FAILED] }
+      Targets:
+        - Id: sns
+          Arn: !Ref ApprovalTopicArn
+
+Outputs:
+  SourceBucket:
+    Value: !Ref SourceBucket
+  PipelineName:
+    Value: !Ref Pipeline
+  PipelineConsoleUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view?region=${AWS::Region}

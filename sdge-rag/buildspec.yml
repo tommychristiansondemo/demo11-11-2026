@@ -1,0 +1,13 @@
+# CodePipeline "Deploy" stage: runs the same script used for local deploys.
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+      python: 3.12
+  build:
+    commands:
+      - chmod +x scripts/*.sh
+      - ./scripts/deploy.sh "$ENV_NAME"
+      - chmod +x insights/deploy.sh
+      - ./insights/deploy.sh "$ENV_NAME"   # Class Insights + projectknowledge.md refresh

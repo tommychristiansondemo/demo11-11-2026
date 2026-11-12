@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SDGE Gas Ops RAG - container build infrastructure: ECR repositories for the Fargate images and a
+  CodeBuild project that builds them natively on Graviton (arm64). No Docker is needed on the
+  machine that runs deploy.sh; the pipeline uses the same builder.
+
+Parameters:
+  EnvName:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  ArtifactsBucket:
+    Type: String
+    Description: Bucket holding the build-context zip (scripts/deploy.sh uploads it)
+
+Resources:
+  AppRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub sdge-rag-${EnvName}-app
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep the 10 newest images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}
+  InsightsRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub sdge-insights-${EnvName}-chat
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep the 10 newest images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}
+
+  BuilderLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/sdge-rag-${EnvName}-image-builder
+      RetentionInDays: 30
+  BuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-and-push
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub ${BuilderLogs.Arn}:*
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${ArtifactsBucket}/image-context/*
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart,
+                         ecr:CompleteLayerUpload, ecr:PutImage, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: [!GetAtt AppRepository.Arn, !GetAtt InsightsRepository.Arn]
+  ImageBuilder:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub sdge-rag-${EnvName}-image-builder
+      Description: Builds and pushes an arm64 container image (env overrides choose Dockerfile/repo/tag)
+      ServiceRole: !GetAtt BuilderRole.Arn
+      TimeoutInMinutes: 20
+      Artifacts: { Type: NO_ARTIFACTS }
+      Source:
+        Type: S3
+        Location: !Sub ${ArtifactsBucket}/image-context/context.zip
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${REPO_URI%%/*}"
+            build:
+              commands:
+                - docker build --pull -f "$DOCKERFILE" -t "$REPO_URI:$IMAGE_TAG" .
+                - docker push "$REPO_URI:$IMAGE_TAG"
+            post_build:
+              commands:
+                - docker inspect --format '{{index .RepoDigests 0}}' "$REPO_URI:$IMAGE_TAG"
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true    # required for docker build
+        EnvironmentVariables:
+          - { Name: REPO_URI, Value: "set-per-build" }
+          - { Name: IMAGE_TAG, Value: "set-per-build" }
+          - { Name: DOCKERFILE, Value: backend/Dockerfile }
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref BuilderLogs }
+
+Outputs:
+  AppRepositoryUri:
+    Value: !GetAtt AppRepository.RepositoryUri
+  InsightsRepositoryUri:
+    Value: !GetAtt InsightsRepository.RepositoryUri
+  ImageBuilderProject:
+    Value: !Ref ImageBuilder

@@ -1,0 +1,17 @@
+# CodePipeline "Validate" stage: static checks + a frontend build, no AWS changes.
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+      python: 3.12
+    commands:
+      - pip install --quiet cfn-lint pyflakes
+  build:
+    commands:
+      - cfn-lint -i W3005 W3002 -- infra/edge.yaml infra/app.yaml infra/pipeline.yaml infra/containers.yaml insights/infra/insights.yaml
+      - python -m pyflakes backend/src insights/backend/src scripts/e2e.py
+      - python -m py_compile backend/src/*.py insights/backend/src/*.py
+      - bash -n scripts/deploy.sh && bash -n insights/deploy.sh
+      - (cd frontend && npm ci --no-audit --no-fund && npx vite build)
+      - (cd insights/frontend && npm ci --no-audit --no-fund && npx vite build)

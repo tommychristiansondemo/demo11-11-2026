@@ -1,0 +1,1013 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Class Insights - companion app that explains the Gas Ops RAG deployment\
+  \ to students. Static SPA in S3 behind CloudFront; dynamic content from Lambda behind\
+  \ an HTTP API whose JWT authorizer trusts the Gas Ops Cognito user pool (same accounts,\
+  \ no separate credentials). Chatbot: Claude on Bedrock with projectknowledge.md\
+  \ + read-only tools over logs/metrics/inventory.\n"
+Parameters:
+  EnvName:
+    Type: String
+    AllowedValues:
+    - dev
+    - staging
+    - prod
+  TargetEnv:
+    Type: String
+    AllowedValues:
+    - dev
+    - staging
+    - prod
+    Description: Which Gas Ops environment this app describes
+  DomainName:
+    Type: String
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+  CertificateArn:
+    Type: String
+  WebAclArn:
+    Type: String
+  UserPoolId:
+    Type: String
+  UserPoolClientId:
+    Type: String
+  ChatModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+  ThinkingBudget:
+    Type: Number
+    Default: 1024
+  ChatImageUri:
+    Type: String
+    Description: ECR image for the chat service (scripts/build-images.sh)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The Gas Ops app VPC (shared, so the chat tasks join the same ECS
+      cluster network)
+  TaskSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  EcsClusterName:
+    Type: String
+    Description: The shared ECS cluster (sdge-rag-<env>)
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+Resources:
+  KnowledgeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: sdge-insights-${EnvName}-knowledge-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+        - Id: old-versions
+          Status: Enabled
+          NoncurrentVersionExpiration:
+            NoncurrentDays: 60
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: sdge-insights-${EnvName}-site-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: SiteBucket
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: cloudfront.amazonaws.com
+          Action: s3:GetObject
+          Resource:
+            Fn::Sub: ${SiteBucket.Arn}/*
+          Condition:
+            StringEquals:
+              AWS:SourceArn:
+                Fn::Sub: arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+  InsightsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+            - ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+      - PolicyName: read-deployment
+        PolicyDocument:
+          Statement:
+          - Sid: ReadClassLogs
+            Effect: Allow
+            Action:
+            - logs:FilterLogEvents
+            - logs:DescribeLogGroups
+            - logs:DescribeLogStreams
+            Resource:
+            - Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/sdge-*
+            - Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/sdge-*
+            - Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/sdge-*
+            - Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/sdge-rag-*
+          - Sid: ReadMetricsAndAlarms
+            Effect: Allow
+            Action:
+            - cloudwatch:GetMetricData
+            - cloudwatch:DescribeAlarms
+            Resource: '*'
+          - Sid: ReadStacks
+            Effect: Allow
+            Action:
+            - cloudformation:DescribeStacks
+            - cloudformation:ListStackResources
+            Resource:
+            - Fn::Sub: arn:aws:cloudformation:us-east-1:${AWS::AccountId}:stack/sdge-*
+            - Fn::Sub: arn:aws:cloudformation:us-east-2:${AWS::AccountId}:stack/sdge-*
+          - Sid: ReadFargate
+            Effect: Allow
+            Action:
+            - ecs:ListServices
+            - ecs:DescribeServices
+            - ecs:ListTasks
+            - ecs:DescribeTasks
+            - ecs:DescribeClusters
+            - ecs:DescribeTaskDefinition
+            - servicediscovery:ListInstances
+            - servicediscovery:DiscoverInstances
+            Resource: '*'
+          - Sid: ReadFunctionConfig
+            Effect: Allow
+            Action: lambda:GetFunctionConfiguration
+            Resource:
+              Fn::Sub: arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:sdge-*
+          - Sid: ReadPlainConfig
+            Effect: Allow
+            Action: ssm:GetParametersByPath
+            Resource:
+            - Fn::Sub: arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdge-rag/*
+            - Fn::Sub: arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sdge-insights/*
+          - Sid: ReadPipeline
+            Effect: Allow
+            Action:
+            - codepipeline:ListPipelineExecutions
+            - codepipeline:GetPipelineState
+            Resource:
+              Fn::Sub: arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:sdge-rag-*
+          - Sid: ReadModelLabConfig
+            Effect: Allow
+            Action:
+            - appconfig:StartConfigurationSession
+            - appconfig:GetLatestConfiguration
+            Resource:
+              Fn::Sub: arn:aws:appconfig:${AWS::Region}:${AWS::AccountId}:application/*
+          - Sid: SearchAndSyncProjectKb
+            Effect: Allow
+            Action:
+            - bedrock:Retrieve
+            - bedrock:StartIngestionJob
+            - bedrock:ListIngestionJobs
+            - bedrock:ListDataSources
+            Resource:
+              Fn::GetAtt:
+              - ProjectKnowledgeBase
+              - KnowledgeBaseArn
+          - Sid: DescribeKnowledgeBases
+            Effect: Allow
+            Action:
+            - bedrock:ListKnowledgeBases
+            - bedrock:GetKnowledgeBase
+            - bedrock:ListDataSources
+            - bedrock:ListIngestionJobs
+            Resource: '*'
+          - Sid: ListGasOpsDocuments
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource:
+              Fn::Sub: arn:aws:s3:::sdge-rag-${TargetEnv}-docs-${AWS::AccountId}-${AWS::Region}
+          - Sid: KnowledgeFile
+            Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:PutObject
+            Resource:
+              Fn::Sub: ${KnowledgeBucket.Arn}/*
+          - Sid: InvokeClaude
+            Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource:
+            - arn:aws:bedrock:*::foundation-model/*
+            - Fn::Sub: arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+          - Sid: NeverTouchSecrets
+            Effect: Deny
+            Action:
+            - secretsmanager:*
+            - apigateway:*
+            - rds-data:*
+            - ssm:GetParameter
+            - ssm:GetParameters
+            Resource: '*'
+  ProjectKbVectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      VectorBucketName:
+        Fn::Sub: sdge-insights-${EnvName}-kb-vectors-${AWS::AccountId}
+  ProjectKbIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn:
+        Fn::GetAtt:
+        - ProjectKbVectorBucket
+        - VectorBucketArn
+      IndexName: project-corpus
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+        - AMAZON_BEDROCK_TEXT
+        - AMAZON_BEDROCK_METADATA
+  ProjectKbRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: bedrock.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              aws:SourceAccount:
+                Ref: AWS::AccountId
+            ArnLike:
+              aws:SourceArn:
+                Fn::Sub: arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*
+      Policies:
+      - PolicyName: kb-access
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource:
+              Fn::Sub: arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource:
+              Fn::Sub: ${KnowledgeBucket.Arn}/kb/*
+          - Effect: Allow
+            Action: s3:ListBucket
+            Resource:
+              Fn::GetAtt:
+              - KnowledgeBucket
+              - Arn
+            Condition:
+              StringLike:
+                s3:prefix:
+                - kb/*
+                - kb
+          - Effect: Allow
+            Action:
+            - s3vectors:PutVectors
+            - s3vectors:GetVectors
+            - s3vectors:DeleteVectors
+            - s3vectors:QueryVectors
+            - s3vectors:ListVectors
+            - s3vectors:GetIndex
+            Resource:
+              Fn::GetAtt:
+              - ProjectKbIndex
+              - IndexArn
+  ProjectKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name:
+        Fn::Sub: sdge-insights-${EnvName}-project-corpus
+      Description: Class Insights project corpus (design narrative, live inventory,
+        IaC templates, source code)
+      RoleArn:
+        Fn::GetAtt:
+        - ProjectKbRole
+        - Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn:
+            Fn::Sub: arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: 1024
+              EmbeddingDataType: FLOAT32
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          IndexArn:
+            Fn::GetAtt:
+            - ProjectKbIndex
+            - IndexArn
+  ProjectKbDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId:
+        Ref: ProjectKnowledgeBase
+      Name: project-corpus
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn:
+            Fn::GetAtt:
+            - KnowledgeBucket
+            - Arn
+          InclusionPrefixes:
+          - kb/
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: 500
+            OverlapPercentage: 15
+  DataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: sdge-insights-${EnvName}-data
+      Runtime: python3.12
+      Handler: data.handler
+      Code:
+        S3Bucket: sdge-rag-artifacts-154833006816-us-east-2
+        S3Key: insights-prod/43cc76ea6ec800b49f7959b46ab34f80
+      Role:
+        Fn::GetAtt:
+        - InsightsRole
+        - Arn
+      MemorySize: 512
+      Timeout: 29
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+        LogGroup:
+          Ref: DataLogs
+      Environment:
+        Variables:
+          ENV_NAME:
+            Ref: EnvName
+          TARGET_ENV:
+            Ref: TargetEnv
+          ACCOUNT_ID:
+            Ref: AWS::AccountId
+          KNOWLEDGE_BUCKET:
+            Ref: KnowledgeBucket
+          CHAT_MODEL_ID:
+            Ref: ChatModelId
+          THINKING_BUDGET:
+            Ref: ThinkingBudget
+          PROJECT_KB_ID:
+            Ref: ProjectKnowledgeBase
+          CONFIG_REV: '3'
+  DataLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/sdge-insights-${EnvName}-data
+      RetentionInDays:
+        Ref: LogRetentionDays
+  ChatTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Insights chat tasks - 8080 from the API Gateway VPC Link only
+      VpcId:
+        Ref: VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        SourceSecurityGroupId:
+          Ref: VpcLinkSecurityGroup
+        Description: HTTP API VPC Link
+  VpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP API VPC Link ENIs (egress to the chat tasks)
+      VpcId:
+        Ref: VpcId
+  HttpVpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name:
+        Fn::Sub: sdge-insights-${EnvName}
+      SubnetIds:
+        Ref: TaskSubnetIds
+      SecurityGroupIds:
+      - Ref: VpcLinkSecurityGroup
+  DiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name:
+        Fn::Sub: insights-${EnvName}.sdge.internal
+      Vpc:
+        Ref: VpcId
+      Description: Cloud Map namespace for Class Insights services
+  ChatDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: chat
+      NamespaceId:
+        Ref: DiscoveryNamespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+        - Type: SRV
+          TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+  ChatExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  ChatServiceLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /ecs/sdge-insights-${EnvName}-chat
+      RetentionInDays:
+        Ref: LogRetentionDays
+  ChatLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/sdge-insights-${EnvName}-chat
+      RetentionInDays:
+        Ref: LogRetentionDays
+  ChatTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family:
+        Fn::Sub: sdge-insights-${EnvName}-chat
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+      - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn:
+        Fn::GetAtt:
+        - ChatExecutionRole
+        - Arn
+      TaskRoleArn:
+        Fn::GetAtt:
+        - InsightsRole
+        - Arn
+      ContainerDefinitions:
+      - Name: chat
+        Image:
+          Ref: ChatImageUri
+        Essential: true
+        PortMappings:
+        - ContainerPort: 8080
+          Protocol: tcp
+        StopTimeout: 30
+        HealthCheck:
+          Command:
+          - CMD
+          - python
+          - -c
+          - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz',
+            timeout=3)
+          Interval: 15
+          Timeout: 5
+          Retries: 3
+          StartPeriod: 20
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group:
+              Ref: ChatServiceLogs
+            awslogs-region:
+              Ref: AWS::Region
+            awslogs-stream-prefix: chat
+        Environment:
+        - Name: AWS_REGION
+          Value:
+            Ref: AWS::Region
+        - Name: ENV_NAME
+          Value:
+            Ref: EnvName
+        - Name: TARGET_ENV
+          Value:
+            Ref: TargetEnv
+        - Name: ACCOUNT_ID
+          Value:
+            Ref: AWS::AccountId
+        - Name: KNOWLEDGE_BUCKET
+          Value:
+            Ref: KnowledgeBucket
+        - Name: CHAT_MODEL_ID
+          Value:
+            Ref: ChatModelId
+        - Name: THINKING_BUDGET
+          Value:
+            Ref: ThinkingBudget
+        - Name: PROJECT_KB_ID
+          Value:
+            Ref: ProjectKnowledgeBase
+        - Name: USER_POOL_ID
+          Value:
+            Ref: UserPoolId
+        - Name: USER_POOL_CLIENT_ID
+          Value:
+            Ref: UserPoolClientId
+  ChatService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName:
+        Fn::Sub: sdge-insights-${EnvName}-chat
+      Cluster:
+        Ref: EcsClusterName
+      TaskDefinition:
+        Ref: ChatTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 1
+      PropagateTags: SERVICE
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            Ref: TaskSubnetIds
+          SecurityGroups:
+          - Ref: ChatTaskSecurityGroup
+          AssignPublicIp: ENABLED
+      ServiceRegistries:
+      - RegistryArn:
+          Fn::GetAtt:
+          - ChatDiscoveryService
+          - Arn
+        ContainerName: chat
+        ContainerPort: 8080
+  KnowledgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: sdge-insights-${EnvName}-knowledge
+      Runtime: python3.12
+      Handler: knowledge.handler
+      Code:
+        S3Bucket: sdge-rag-artifacts-154833006816-us-east-2
+        S3Key: insights-prod/43cc76ea6ec800b49f7959b46ab34f80
+      Role:
+        Fn::GetAtt:
+        - InsightsRole
+        - Arn
+      MemorySize: 512
+      Timeout: 120
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+        LogGroup:
+          Ref: KnowledgeLogs
+      Environment:
+        Variables:
+          ENV_NAME:
+            Ref: EnvName
+          TARGET_ENV:
+            Ref: TargetEnv
+          ACCOUNT_ID:
+            Ref: AWS::AccountId
+          KNOWLEDGE_BUCKET:
+            Ref: KnowledgeBucket
+          CHAT_MODEL_ID:
+            Ref: ChatModelId
+          THINKING_BUDGET:
+            Ref: ThinkingBudget
+          PROJECT_KB_ID:
+            Ref: ProjectKnowledgeBase
+          CONFIG_REV: '3'
+  KnowledgeLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/sdge-insights-${EnvName}-knowledge
+      RetentionInDays:
+        Ref: LogRetentionDays
+  KnowledgeOnStackChange:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Regenerate projectknowledge.md when a class stack finishes changing
+      EventPattern:
+        source:
+        - aws.cloudformation
+        detail-type:
+        - CloudFormation Stack Status Change
+        detail:
+          stack-id:
+          - wildcard:
+              Fn::Sub: arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/sdge-*
+          status-details:
+            status:
+            - CREATE_COMPLETE
+            - UPDATE_COMPLETE
+            - UPDATE_ROLLBACK_COMPLETE
+            - DELETE_COMPLETE
+      Targets:
+      - Id: knowledge
+        Arn:
+          Fn::GetAtt:
+          - KnowledgeFunction
+          - Arn
+  KnowledgeSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(6 hours)
+      Targets:
+      - Id: knowledge
+        Arn:
+          Fn::GetAtt:
+          - KnowledgeFunction
+          - Arn
+  KnowledgePermStack:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: KnowledgeFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt:
+        - KnowledgeOnStackChange
+        - Arn
+  KnowledgePermSchedule:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: KnowledgeFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt:
+        - KnowledgeSchedule
+        - Arn
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name:
+        Fn::Sub: sdge-insights-${EnvName}
+      ProtocolType: HTTP
+      Description: Class Insights API (JWT = Gas Ops Cognito ID token)
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      Name: gas-ops-cognito
+      AuthorizerType: JWT
+      IdentitySource:
+      - $request.header.Authorization
+      JwtConfiguration:
+        Issuer:
+          Fn::Sub: https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}
+        Audience:
+        - Ref: UserPoolClientId
+  DataIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::GetAtt:
+        - DataFunction
+        - Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+  ChatIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId:
+        Ref: HttpVpcLink
+      IntegrationUri:
+        Fn::GetAtt:
+        - ChatDiscoveryService
+        - Arn
+      PayloadFormatVersion: '1.0'
+      TimeoutInMillis: 30000
+  DataRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      RouteKey: GET /api/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId:
+        Ref: JwtAuthorizer
+      Target:
+        Fn::Sub: integrations/${DataIntegration}
+  ChatRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      RouteKey: POST /api/chat
+      AuthorizationType: JWT
+      AuthorizerId:
+        Ref: JwtAuthorizer
+      Target:
+        Fn::Sub: integrations/${ChatIntegration}
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/apigateway/sdge-insights-${EnvName}-access
+      RetentionInDays:
+        Ref: LogRetentionDays
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId:
+        Ref: HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 10
+        ThrottlingBurstLimit: 20
+        DetailedMetricsEnabled: true
+      AccessLogSettings:
+        DestinationArn:
+          Fn::GetAtt:
+          - ApiAccessLogs
+          - Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","user":"$context.authorizer.claims.cognito:username","route":"$context.routeKey","status":"$context.status","latencyMs":"$context.responseLatency","error":"$context.error.message","authError":"$context.authorizer.error"}'
+  DataInvokePerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: DataFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+  SiteOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name:
+          Fn::Sub: sdge-insights-${EnvName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  SpaRewrite:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name:
+        Fn::Sub: sdge-insights-${EnvName}-spa
+      AutoPublish: true
+      FunctionConfig:
+        Comment: SPA fallback
+        Runtime: cloudfront-js-2.0
+      FunctionCode: "function handler(event) {\n  var r = event.request;\n  if (r.uri\
+        \ === '/' || r.uri.indexOf('.') === -1) { r.uri = '/index.html'; }\n  return\
+        \ r;\n}\n"
+  HeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name:
+          Fn::Sub: sdge-insights-${EnvName}-security
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: false
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy:
+              Fn::Sub: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'
+                https://fonts.googleapis.com; font-src https://fonts.gstatic.com;
+                img-src 'self' data:; connect-src 'self' https://cognito-idp.${AWS::Region}.amazonaws.com;
+                frame-ancestors 'none'
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment:
+          Fn::Sub: Class Insights ${EnvName} (${DomainName})
+        Aliases:
+        - Ref: DomainName
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        WebACLId:
+          Ref: WebAclArn
+        ViewerCertificate:
+          AcmCertificateArn:
+            Ref: CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+        - Id: site
+          DomainName:
+            Fn::GetAtt:
+            - SiteBucket
+            - RegionalDomainName
+          OriginAccessControlId:
+            Fn::GetAtt:
+            - SiteOac
+            - Id
+          S3OriginConfig:
+            OriginAccessIdentity: ''
+        - Id: api
+          DomainName:
+            Fn::Sub: ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+          CustomOriginConfig:
+            OriginProtocolPolicy: https-only
+            OriginSSLProtocols:
+            - TLSv1.2
+            OriginReadTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId:
+            Ref: HeadersPolicy
+          FunctionAssociations:
+          - EventType: viewer-request
+            FunctionARN:
+              Fn::GetAtt:
+              - SpaRewrite
+              - FunctionMetadata.FunctionARN
+        CacheBehaviors:
+        - PathPattern: /api/*
+          TargetOriginId: api
+          ViewerProtocolPolicy: https-only
+          AllowedMethods:
+          - GET
+          - HEAD
+          - OPTIONS
+          - PUT
+          - PATCH
+          - POST
+          - DELETE
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          ResponseHeadersPolicyId:
+            Ref: HeadersPolicy
+      Tags:
+      - Key: app
+        Value: sdge-insights
+      - Key: env
+        Value:
+          Ref: EnvName
+  DnsA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId:
+        Ref: HostedZoneId
+      Name:
+        Ref: DomainName
+      Type: A
+      AliasTarget:
+        DNSName:
+          Fn::GetAtt:
+          - Distribution
+          - DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+  DnsAaaa:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId:
+        Ref: HostedZoneId
+      Name:
+        Ref: DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName:
+          Fn::GetAtt:
+          - Distribution
+          - DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+  ChatErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: sdge-insights-${EnvName}-chat-errors
+      AlarmDescription: Class Insights chat service (Fargate) is logging errors
+      Namespace:
+        Fn::Sub: SdgeInsights/${EnvName}
+      MetricName: ChatErrorLogs
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+      - Fn::Sub: arn:aws:sns:${AWS::Region}:${AWS::AccountId}:sdge-rag-${TargetEnv}-alerts
+  ChatErrorLogFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName:
+        Ref: ChatServiceLogs
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+      - MetricNamespace:
+          Fn::Sub: SdgeInsights/${EnvName}
+        MetricName: ChatErrorLogs
+        MetricValue: '1'
+        DefaultValue: 0
+  KnowledgeErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: sdge-insights-${EnvName}-knowledge-errors
+      AlarmDescription: projectknowledge.md regeneration failed
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+      - Name: FunctionName
+        Value:
+          Ref: KnowledgeFunction
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+      - Fn::Sub: arn:aws:sns:${AWS::Region}:${AWS::AccountId}:sdge-rag-${TargetEnv}-alerts
+Outputs:
+  SiteUrl:
+    Value:
+      Fn::Sub: https://${DomainName}
+  SiteBucketName:
+    Value:
+      Ref: SiteBucket
+  KnowledgeBucketName:
+    Value:
+      Ref: KnowledgeBucket
+  ProjectKnowledgeBaseId:
+    Value:
+      Ref: ProjectKnowledgeBase
+  DistributionId:
+    Value:
+      Ref: Distribution
+  HttpApiId:
+    Value:
+      Ref: HttpApi
